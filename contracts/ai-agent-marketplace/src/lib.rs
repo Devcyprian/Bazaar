@@ -2399,3 +2399,6 @@ impl AiAgentMarketplace {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod budget_test;
