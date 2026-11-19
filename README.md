@@ -719,6 +719,8 @@ owners and due dates.
 
 ## 🔐 Security
 
+See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for fund flows, trust assumptions, admin capabilities and mitigations.
+
 ### Smart Contract
 =======
 
