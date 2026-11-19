@@ -14,10 +14,37 @@ Let me write the complete file:
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    contract, contractimpl,
+    testutils::{Address as _, Events as _, Ledger},
     Address, BytesN, Env, IntoVal, String, Vec, Map, symbol_short,
     token::{Client as TokenClient, StellarAssetClient as TokenAdminClient},
 };
+
+// ==================== Failing Token Mock ====================
+
+/// A mock token contract whose `transfer` always panics, used to verify
+/// that the marketplace does not persist state changes when a token
+/// transfer fails.
+#[contract]
+pub struct FailingToken;
+
+#[contractimpl]
+impl FailingToken {
+    pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {
+        panic!("FailingToken: transfer always fails");
+    }
+    pub fn transfer_from(_env: Env, _spender: Address, _from: Address, _to: Address, _amount: i128) {
+        panic!("FailingToken: transfer_from always fails");
+    }
+    pub fn balance(_env: Env, _id: Address) -> i128 {
+        0
+    }
+    pub fn approve(_env: Env, _from: Address, _spender: Address, _amount: i128, _expiration_ledger: u32) {}
+    pub fn allowance(_env: Env, _from: Address, _spender: Address) -> i128 { 0 }
+    pub fn decimals(env: Env) -> u32 { let _ = env; 7 }
+    pub fn name(env: Env) -> String { String::from_str(&env, "FailingToken") }
+    pub fn symbol(env: Env) -> String { String::from_str(&env, "FAIL") }
+}
 
 fn create_token_contract(e: &Env) -> TokenClient {
     let admin = Address::generate(e);
@@ -759,6 +786,8 @@ fn test_skill_verification() {
         &30,
         &Vec::from_array(&e, [verifier.clone()]),
         &false, // require_skill_verification
+        &1_000_000_000,  // max_job_budget
+        &10_000_000_000, // max_total_escrow
     );
 
     // Register agent
@@ -2714,6 +2743,8 @@ fn create_marketplace_with_verification_flag<'a>(
         &30,
         &Vec::from_array(e, [verifier.clone()]),
         &require_skill_verification,
+        &1_000_000_000,  // max_job_budget
+        &10_000_000_000, // max_total_escrow
     );
 
     client
@@ -2756,6 +2787,434 @@ fn test_bid_allowed_when_verification_not_required() {
         &100_000_000,
         &14,
     );
+
+    // Bidding is allowed even though the agent is not verified.
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(&e, "Proposal"),
+    );
+    assert_eq!(bid_id, 1);
+}
+
+// ==================== #121: Client reputation from agent reviews ====================
+
+/// A fresh client has zeroed stats.
+#[test]
+fn test_client_stats_start_zeroed() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let stats = marketplace.get_client_stats(&client_addr);
+    assert_eq!(stats.rating_sum, 0);
+    assert_eq!(stats.rating_count, 0);
+    assert_eq!(stats.jobs_posted, 0);
+    assert_eq!(stats.disputes, 0);
+}
+
+/// `jobs_posted` increments each time the client posts a job.
+#[test]
+fn test_client_stats_jobs_posted_increments() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job1"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &14,
+    );
+    marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job2"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &14,
+    );
+
+    let stats = marketplace.get_client_stats(&client_addr);
+    assert_eq!(stats.jobs_posted, 2);
+}
+
+/// An agent reviewing a client updates `rating_sum` / `rating_count`.
+#[test]
+fn test_client_stats_updated_on_agent_review() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let admin_token = TokenAdminClient::new(&e, &usdc.address());
+    admin_token.mint(&client_addr, &200_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &50_000_000,
+        &String::from_str(&e, "ipfs://QmTest"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &100_000_000,
+        &14,
+    );
+
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(&e, "Proposal"),
+    );
+
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    let hash = BytesN::from_array(&e, &[1u8; 32]);
+    marketplace.submit_deliverable(&agent_owner, &job_id, &hash);
+    marketplace.approve_deliverable(&client_addr, &job_id);
+
+    // Agent reviews the client.
+    marketplace.leave_review(
+        &agent_owner,
+        &job_id,
+        &4,
+        &String::from_str(&e, "Good client"),
+    );
+
+    let stats = marketplace.get_client_stats(&client_addr);
+    assert_eq!(stats.rating_sum, 4);
+    assert_eq!(stats.rating_count, 1);
+    assert_eq!(stats.jobs_posted, 1);
+}
+
+/// Raising a dispute increments the client's `disputes` counter.
+#[test]
+fn test_client_stats_disputes_increments() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let admin_token = TokenAdminClient::new(&e, &usdc.address());
+    admin_token.mint(&client_addr, &200_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &50_000_000,
+        &String::from_str(&e, "ipfs://QmTest"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &100_000_000,
+        &14,
+    );
+
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(&e, "Proposal"),
+    );
+
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    let hash = BytesN::from_array(&e, &[1u8; 32]);
+    marketplace.submit_deliverable(&agent_owner, &job_id, &hash);
+
+    marketplace.raise_dispute(
+        &client_addr,
+        &job_id,
+        &String::from_str(&e, "Bad work"),
+        &String::from_str(&e, "ipfs://QmEvidence"),
+    );
+
+    let stats = marketplace.get_client_stats(&client_addr);
+    assert_eq!(stats.disputes, 1);
+}
+
+// ==================== #122: leave_review must not unwrap assigned_agent ====================
+
+/// Drive a job to `Refunded` via `resolve_dispute` (resolution "client"),
+/// then attempt `leave_review`. The contract must return `AgentNotFound`
+/// instead of trapping on an unwrapped `assigned_agent`.
+#[test]
+fn test_leave_review_on_refunded_job_returns_agent_not_found() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let admin_token = TokenAdminClient::new(&e, &usdc.address());
+    admin_token.mint(&client_addr, &200_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &50_000_000,
+        &String::from_str(&e, "ipfs://QmTest"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &100_000_000,
+        &14,
+    );
+
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(&e, "Proposal"),
+    );
+
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    let hash = BytesN::from_array(&e, &[1u8; 32]);
+    marketplace.submit_deliverable(&agent_owner, &job_id, &hash);
+
+    let dispute_id = marketplace.raise_dispute(
+        &client_addr,
+        &job_id,
+        &String::from_str(&e, "Bad work"),
+        &String::from_str(&e, "ipfs://QmEvidence"),
+    );
+
+    // Resolve in favour of the client -> job becomes Refunded.
+    marketplace.resolve_dispute(
+        &admin,
+        &dispute_id,
+        &String::from_str(&e, "client"),
+        &Option::None,
+    );
+
+    let job = marketplace.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Refunded);
+
+    // leave_review must return an error, not trap.
+    let result = marketplace.try_leave_review(
+        &client_addr,
+        &job_id,
+        &5,
+        &String::from_str(&e, "Review"),
+    );
+    assert_eq!(result, Err(Ok(Error::AgentNotFound)));
+}
+
+// ==================== #123: O(1) duplicate-review check ====================
+
+/// A second review by the same reviewer on the same job is rejected.
+#[test]
+fn test_duplicate_review_rejected() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let admin_token = TokenAdminClient::new(&e, &usdc.address());
+    admin_token.mint(&client_addr, &200_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &50_000_000,
+        &String::from_str(&e, "ipfs://QmTest"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &100_000_000,
+        &14,
+    );
+
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(&e, "Proposal"),
+    );
+
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    let hash = BytesN::from_array(&e, &[1u8; 32]);
+    marketplace.submit_deliverable(&agent_owner, &job_id, &hash);
+    marketplace.approve_deliverable(&client_addr, &job_id);
+
+    // First review succeeds.
+    marketplace.leave_review(
+        &client_addr,
+        &job_id,
+        &5,
+        &String::from_str(&e, "Great work!"),
+    );
+
+    // Second review by the same reviewer on the same job is rejected.
+    let result = marketplace.try_leave_review(
+        &client_addr,
+        &job_id,
+        &4,
+        &String::from_str(&e, "Again"),
+    );
+    assert_eq!(result, Err(Ok(Error::AlreadyReviewed)));
+}
+
+// ==================== #126: config_upd event carries the diff ====================
+
+/// `update_config` emits one `config_upd` event per changed field with a
+/// `(field_symbol, old, new)` payload, and no event for unchanged fields.
+#[test]
+fn test_update_config_emits_diff_events() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    // Change two fields; leave the rest untouched.
+    marketplace.update_config(
+        &admin,
+        &Option::Some(150u32), // platform_fee_bps: 100 -> 150
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::Some(20u32), // max_job_deadline_days: 30 -> 20
+    );
+
+    let events = e.events().all();
+    let mut fee_events = 0u32;
+    let mut deadline_events = 0u32;
+
+    for ev in events.iter() {
+        let (_contract, topics, data) = ev;
+        // Only inspect our own config_upd events.
+        if topics.len() == 1 {
+            let topic: soroban_sdk::Symbol = topics.get(0).unwrap().into_val(&e);
+            if topic == symbol_short!("config_upd") {
+                let (field, old, new): (soroban_sdk::Symbol, u32, u32) =
+                    data.into_val(&e);
+                if field == symbol_short!("fee_bps") {
+                    assert_eq!(old, 100);
+                    assert_eq!(new, 150);
+                    fee_events += 1;
+                } else if field == symbol_short!("max_days") {
+                    assert_eq!(old, 30);
+                    assert_eq!(new, 20);
+                    deadline_events += 1;
+                }
+            }
+        }
+    }
+
+    assert_eq!(fee_events, 1);
+    assert_eq!(deadline_events, 1);
+}
+
+/// No `config_upd` event is emitted when nothing actually changes.
+#[test]
+fn test_update_config_no_event_when_unchanged() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    // Pass the existing value for platform_fee_bps (100) -> no change.
+    marketplace.update_config(
+        &admin,
+        &Option::Some(100u32),
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+    );
+
+    let events = e.events().all();
+    let mut config_events = 0u32;
+    for ev in events.iter() {
+        let (_contract, topics, _data) = ev;
+        if topics.len() == 1 {
+            let topic: soroban_sdk::Symbol = topics.get(0).unwrap().into_val(&e);
+            if topic == symbol_short!("config_upd") {
+                config_events += 1;
+            }
+        }
+    }
+    assert_eq!(config_events, 0);
+}
 
 For `resolve_dispute` while paused - need to set up dispute, then pause, then resolve.
 
