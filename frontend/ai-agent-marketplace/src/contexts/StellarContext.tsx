@@ -13,7 +13,11 @@ import {
   Keypair,
   StrKey
 } from '@stellar/stellar-sdk';
-import { MarketplaceClient } from '@/lib/marketplaceClient';
+import {
+  MarketplaceClient,
+  describeSimulationError,
+  formatTokenAmount,
+} from '@/lib/marketplaceClient';
 
 export interface ContractConfig {
   contractId: string;
@@ -136,7 +140,7 @@ export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({ child
     const simResult = await rpc.simulateTransaction(tx);
     
     if (SorobanRpc.Api.isSimulationError(simResult)) {
-      throw new Error(`Simulation failed: ${simResult.error}`);
+      throw new Error(describeSimulationError(simResult.error));
     }
     
     return (simResult as any).result?.retval ?? null;
@@ -162,8 +166,25 @@ export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({ child
       .setTimeout(60)
       .build();
 
-    // Simulates, then attaches the resulting footprint/auth/resource fees.
-    const prepared = await rpc.prepareTransaction(tx);
+    // Always simulate first: a failed simulation blocks signing, and a
+    // successful one gives us the footprint/auth/resource fees to attach.
+    const simResult = await rpc.simulateTransaction(tx);
+    if (SorobanRpc.Api.isSimulationError(simResult)) {
+      throw new Error(describeSimulationError(simResult.error));
+    }
+    const prepared = SorobanRpc.assembleTransaction(tx, simResult).build();
+
+    // Show the estimated network fee (and the USDC amount, if the call takes
+    // one) before handing the transaction to the wallet for signing.
+    const feeLines = [`Estimated network fee: ${formatTokenAmount(prepared.fee, 7)} XLM`];
+    const usdcArg = args.find((arg) => arg.switch().name === 'scvI128');
+    if (usdcArg) {
+      feeLines.push(`USDC amount: ${formatTokenAmount(scValToNative(usdcArg), 7)} USDC`);
+    }
+    if (!window.confirm(`${feeLines.join('\n')}\n\nSign and submit this transaction?`)) {
+      throw new Error('Transaction cancelled.');
+    }
+
     const signedXdr = await signTransaction(prepared.toXDR());
     const signedTx = TransactionBuilder.fromXDR(signedXdr, config.networkPassphrase) as Transaction;
 

@@ -163,10 +163,144 @@ function unwrapResult(v: Native): Native {
     if (tag === 'Err') {
       const err = v[2];
       const name = enumVal(err) || 'UnknownError';
-      throw new Error(`Contract error: ${name}`);
+      throw new Error(contractErrorMessage(name));
     }
   }
   return v;
+}
+
+// ── contract error messages ───────────────────────────────────────────────────
+/** Discriminants of the contract's `Error` enum (contracts/.../lib.rs). */
+const CONTRACT_ERROR_NAMES: Record<number, string> = {
+  1: 'NotInitialized',
+  2: 'AlreadyInitialized',
+  3: 'Unauthorized',
+  4: 'AgentNotFound',
+  5: 'AgentAlreadyExists',
+  6: 'AgentNotActive',
+  7: 'JobNotFound',
+  8: 'JobNotOpen',
+  9: 'JobNotInProgress',
+  10: 'JobNotCompleted',
+  11: 'JobAlreadyAssigned',
+  12: 'InsufficientBudget',
+  13: 'BidNotFound',
+  14: 'BidNotPending',
+  15: 'BidAlreadyExists',
+  16: 'InsufficientBidAmount',
+  17: 'BidTooLow',
+  18: 'AgentReputationTooLow',
+  19: 'InsufficientSkills',
+  20: 'SkillNotVerified',
+  21: 'EscrowNotFound',
+  22: 'EscrowNotFunded',
+  23: 'EscrowAlreadyReleased',
+  24: 'EscrowNotDisputed',
+  25: 'InsufficientEscrowBalance',
+  26: 'InvalidDeadline',
+  27: 'InvalidBudget',
+  28: 'InvalidRating',
+  29: 'ReviewNotFound',
+  30: 'AlreadyReviewed',
+  31: 'DisputeNotFound',
+  32: 'DisputeNotOpen',
+  33: 'DisputeWindowExpired',
+  34: 'UnauthorizedResolver',
+  35: 'InvalidToken',
+  36: 'InsufficientBalance',
+  37: 'TransferFailed',
+  38: 'EscrowExpired',
+  39: 'JobExpired',
+  40: 'InvalidSkill',
+  41: 'SkillAlreadyVerified',
+  42: 'VerifierNotAuthorized',
+  43: 'VerificationExpired',
+  44: 'PlatformNotInitialized',
+  45: 'InvalidConfig',
+  46: 'JobCancelled',
+  47: 'AlreadyDisputed',
+  48: 'DisputeResolved',
+  49: 'EscrowAlreadyRefunded',
+  50: 'InvalidDisputeEvidence',
+  51: 'ContractPaused',
+  52: 'CannotBidOnOwnJob',
+  53: 'AddressBlocked',
+};
+
+/** Human-readable text for each contract `Error` variant. */
+const CONTRACT_ERROR_MESSAGES: Record<string, string> = {
+  NotInitialized: 'The marketplace contract has not been initialized.',
+  AlreadyInitialized: 'The marketplace contract is already initialized.',
+  Unauthorized: 'You are not authorized to perform this action.',
+  AgentNotFound: 'Agent not found.',
+  AgentAlreadyExists: 'This wallet already has a registered agent.',
+  AgentNotActive: 'This agent is not active.',
+  JobNotFound: 'Job not found.',
+  JobNotOpen: 'This job is no longer open.',
+  JobNotInProgress: 'This job is not in progress.',
+  JobNotCompleted: 'This job has not been completed yet.',
+  JobAlreadyAssigned: 'This job has already been assigned.',
+  InsufficientBudget: 'The job budget is too low.',
+  BidNotFound: 'Bid not found.',
+  BidNotPending: 'This bid is no longer pending.',
+  BidAlreadyExists: 'You have already placed a bid on this job.',
+  InsufficientBidAmount: 'The bid amount is too low.',
+  BidTooLow: 'The bid amount is below the minimum allowed.',
+  AgentReputationTooLow: 'Your agent reputation is too low for this job.',
+  InsufficientSkills: 'Your agent does not have the skills required for this job.',
+  SkillNotVerified: 'A required skill has not been verified.',
+  SkillVerificationRequired: 'A required skill must be verified before you can bid.',
+  EscrowNotFound: 'Escrow not found for this job.',
+  EscrowNotFunded: 'The escrow for this job is not funded.',
+  EscrowAlreadyReleased: 'The escrow for this job has already been released.',
+  EscrowNotDisputed: 'The escrow for this job is not under dispute.',
+  InsufficientEscrowBalance: 'The escrow balance is insufficient.',
+  InvalidDeadline: 'The deadline is invalid.',
+  InvalidBudget: 'The budget is invalid.',
+  InvalidRating: 'The rating must be between 1 and 5.',
+  ReviewNotFound: 'Review not found.',
+  AlreadyReviewed: 'You have already reviewed this job.',
+  DisputeNotFound: 'Dispute not found.',
+  DisputeNotOpen: 'This dispute is not open.',
+  DisputeWindowExpired: 'The dispute window for this job has expired.',
+  UnauthorizedResolver: 'You are not authorized to resolve this dispute.',
+  InvalidToken: 'The payment token is invalid.',
+  InsufficientBalance: 'Your USDC balance is too low for this transaction.',
+  TransferFailed: 'The USDC transfer failed.',
+  EscrowExpired: 'The escrow for this job has expired.',
+  JobExpired: 'This job has expired.',
+  InvalidSkill: 'The skill is invalid.',
+  SkillAlreadyVerified: 'This skill is already verified.',
+  VerifierNotAuthorized: 'You are not an authorized skill verifier.',
+  VerificationExpired: 'The skill verification has expired.',
+  PlatformNotInitialized: 'The platform has not been initialized.',
+  InvalidConfig: 'The platform configuration is invalid.',
+  JobCancelled: 'This job has been cancelled.',
+  AlreadyDisputed: 'A dispute has already been raised for this job.',
+  DisputeResolved: 'This dispute has already been resolved.',
+  EscrowAlreadyRefunded: 'The escrow for this job has already been refunded.',
+  InvalidDisputeEvidence: 'The dispute evidence is invalid.',
+  ContractPaused: 'The marketplace is temporarily paused.',
+  CannotBidOnOwnJob: 'You cannot bid on your own job.',
+  AddressBlocked: 'This wallet address is blocked by compliance policy.',
+};
+
+/** Readable message for a contract `Error` variant name or numeric code. */
+export function contractErrorMessage(nameOrCode: string | number): string {
+  const name =
+    typeof nameOrCode === 'number' ? CONTRACT_ERROR_NAMES[nameOrCode] : nameOrCode;
+  return (name && CONTRACT_ERROR_MESSAGES[name]) || `Contract error: ${name || nameOrCode}`;
+}
+
+/**
+ * Translate an RPC simulation error string (e.g. `HostError: Error(Contract, #8)`)
+ * into a readable message. Falls back to the raw error when no contract error
+ * code is present.
+ */
+export function describeSimulationError(error: string): string {
+  const match = /Error\(Contract, #(\d+)\)/.exec(error);
+  if (match) return contractErrorMessage(Number(match[1]));
+  return `Simulation failed: ${error}`;
 }
 
 // ── struct mappers ────────────────────────────────────────────────────────────
