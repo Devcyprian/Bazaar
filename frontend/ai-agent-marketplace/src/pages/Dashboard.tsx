@@ -8,7 +8,7 @@ import { Input } from '@/components/ui/Input';
 import { 
   DollarSign, Clock, Star, User, CheckCircle, AlertCircle, 
   ArrowRight, Send, Wallet, Loader2, Plus, Edit, Trash2,
-  TrendingUp, Activity, FileText, Shield, MessageSquare
+  TrendingUp, Activity, FileText, Shield, MessageSquare, Download
 } from 'lucide-react';
 import { useWallet } from '@/contexts/WalletContext';
 import { useStellar } from '@/contexts/StellarContext';
@@ -20,6 +20,67 @@ import { format, formatDistanceToNow } from 'date-fns';
 
 /** Number of items fetched per page from the contract. */
 const PAGE_SIZE = 20;
+
+/** Stellar token decimals (USDC uses 7). */
+const TOKEN_DECIMALS = 7;
+
+/** A single on-chain payment / escrow record for accounting exports. */
+interface PaymentRecord {
+  jobId: number;
+  title: string;
+  status: string;
+  amount: number;
+  fee: number;
+  txHash: string;
+  createdAt: number;
+}
+
+/** Convert a raw on-chain amount (stroops) to a decimal token amount. */
+function fromTokenDecimals(raw: number, decimals: number = TOKEN_DECIMALS): number {
+  return raw / Math.pow(10, decimals);
+}
+
+/** Escape a value for safe inclusion in a CSV cell. */
+function csvCell(value: string | number): string {
+  const str = String(value ?? '');
+  return /[",\n\r]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+}
+
+/** Build a CSV string from payment records. */
+function buildPaymentsCsv(records: PaymentRecord[]): string {
+  const header = [
+    'Job ID',
+    'Title',
+    'Status',
+    'Amount',
+    'Fee',
+    'Transaction Hash',
+    'Created At',
+  ];
+  const rows = records.map(r => [
+    r.jobId,
+    r.title,
+    r.status,
+    fromTokenDecimals(r.amount).toFixed(TOKEN_DECIMALS),
+    fromTokenDecimals(r.fee).toFixed(TOKEN_DECIMALS),
+    r.txHash,
+    new Date(r.createdAt * 1000).toISOString(),
+  ]);
+  return [header, ...rows].map(row => row.map(csvCell).join(',')).join('\n');
+}
+
+/** Trigger a browser download of the given CSV content. */
+function downloadCsv(filename: string, csv: string): void {
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
 
 const statusConfig = {
   Open: { label: 'Open', color: 'success' as const, icon: DollarSign },
@@ -162,6 +223,34 @@ export const Dashboard: React.FC = () => {
     staleTime: 1000 * 60 * 10,
   });
 
+  // ── Payment / escrow records for CSV export ─────────────────────────────
+  const { data: paymentRecords = [], isLoading: paymentsLoading } = useQuery<PaymentRecord[]>({
+    queryKey: ['paymentRecords', publicKey],
+    queryFn: async () => {
+      const client = getContractClient();
+      if (!client) {
+        throw new Error('Not connected to the marketplace contract. Configure it in Settings.');
+      }
+      const ids: number[] = await client.getJobsByClient(publicKey, 0, PAGE_SIZE);
+      const jobs: Job[] = await Promise.all(ids.map((id: number) => client.getJob(id)));
+      return jobs.map(job => ({
+        jobId: job.id,
+        title: job.title,
+        status: job.status,
+        amount: job.escrowAmount ?? job.budget ?? 0,
+        fee: (job as Job & { platformFee?: number }).platformFee ?? 0,
+        txHash: (job as Job & { txHash?: string }).txHash ?? '',
+        createdAt: job.createdAt,
+      }));
+    },
+    enabled: !!publicKey,
+  });
+
+  const handleExportCsv = () => {
+    const csv = buildPaymentsCsv(paymentRecords);
+    downloadCsv(`payments-${publicKey.slice(0, 8)}-${format(new Date(), 'yyyyMMdd')}.csv`, csv);
+  };
+
   // ── Reviews received (paginated) ────────────────────────────────────────
   const {
     data: reviewsPages,
@@ -231,6 +320,18 @@ export const Dashboard: React.FC = () => {
               <p className="text-muted-foreground">Manage your jobs, bids, and agent profile</p>
             </div>
             <div className="flex gap-3">
+              <Button
+                variant="outline"
+                onClick={handleExportCsv}
+                disabled={paymentsLoading || paymentRecords.length === 0}
+              >
+                {paymentsLoading ? (
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                ) : (
+                  <Download className="h-4 w-4 mr-2" />
+                )}
+                Export CSV
+              </Button>
               <Link to="/create-job">
                 <Button>
                   <Plus className="h-4 w-4 mr-2" />

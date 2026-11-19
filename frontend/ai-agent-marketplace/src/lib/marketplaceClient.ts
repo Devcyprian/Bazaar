@@ -33,6 +33,7 @@ import type {
   Bid,
   Escrow,
   Job,
+  PaymentRecord,
   PlatformStats,
   Review,
 } from './types';
@@ -257,7 +258,41 @@ function mapEscrow(raw: Native): Escrow {
     resolver: optionVal<string>(raw.resolver, toStr),
   };
 }
+
+function mapPaymentRecord(raw: Native): PaymentRecord {
+  return {
+    jobId: toNum(raw.job_id),
+    account: toStr(raw.account),
+    amount: toNum(raw.amount),
+    fee: toNum(raw.fee),
+    token: toStr(raw.token),
+    txHash: optionVal<string>(raw.tx_hash, toHex),
+    createdAt: toNum(raw.created_at),
+  };
+}
 /* eslint-enable @typescript-eslint/no-explicit-any */
+
+// ── amount formatting ─────────────────────────────────────────────────────────
+/**
+ * Format an i128 token amount (raw base units) into a decimal string using the
+ * token's `decimals` (e.g. 7 for Stellar assets). Returns a plain decimal
+ * string without thousands separators so it can be written straight to CSV.
+ */
+export function formatTokenAmount(
+  amount: number | bigint | string,
+  decimals: number,
+): string {
+  const raw = BigInt(amount);
+  const negative = raw < 0n;
+  const abs = negative ? -raw : raw;
+  const d = Math.max(0, Math.trunc(decimals));
+  if (d === 0) return `${negative ? '-' : ''}${abs.toString()}`;
+  const base = 10n ** BigInt(d);
+  const whole = abs / base;
+  const frac = (abs % base).toString().padStart(d, '0').replace(/0+$/, '');
+  const body = frac.length > 0 ? `${whole.toString()}.${frac}` : whole.toString();
+  return `${negative ? '-' : ''}${body}`;
+}
 
 // ── client ─────────────────────────────────────────────────────────────────────
 export class MarketplaceClient {
@@ -371,6 +406,41 @@ export class MarketplaceClient {
     unwrapResult(raw);
   }
 
+  // ── compliance: denylist (admin-managed, no redeploy) ─────────────────────
+  /** Read the full denylist of blocked addresses. */
+  async getDenylist(): Promise<string[]> {
+    return toStringArray(await this.call('get_denylist'));
+  }
+
+  /** Returns true if `address` is on the on-chain denylist. */
+  async isAddressBlocked(address: string): Promise<boolean> {
+    return toBool(await this.call('is_address_blocked', addr(address)));
+  }
+
+  /** Admin-only: add `address` to the denylist. */
+  async addToDenylist(
+    publicKey: string,
+    signTransaction: SignFn,
+    address: string,
+  ): Promise<void> {
+    const raw = await this.send(
+      'add_to_denylist', publicKey, signTransaction, addr(publicKey), addr(address),
+    );
+    unwrapResult(raw);
+  }
+
+  /** Admin-only: remove `address` from the denylist. */
+  async removeFromDenylist(
+    publicKey: string,
+    signTransaction: SignFn,
+    address: string,
+  ): Promise<void> {
+    const raw = await this.send(
+      'remove_from_denylist', publicKey, signTransaction, addr(publicKey), addr(address),
+    );
+    unwrapResult(raw);
+  }
+
   // ── single-record getters (Result<T, Error>) ──────────────────────────────
   async getAgent(agentId: number): Promise<Agent> {
     return mapAgent(unwrapResult(await this.call('get_agent', u64(agentId))));
@@ -435,6 +505,53 @@ export class MarketplaceClient {
 
   async getAgentsBySkill(skill: string, offset: number, limit: number): Promise<number[]> {
     return toIdArray(await this.call('get_agents_by_skill', str(skill), u64(offset), u64(limit)));
+  }
+
+  // ── payments (for CSV export) ──────────────────────────────────────────────
+  /**
+   * Fetch payment records for an account (jobs, amounts, fees, tx hashes).
+   * Falls back to deriving records from the account's jobs + escrows when the
+   * contract does not expose a dedicated `get_payments_by_account` method.
+   */
+  async getPaymentsByAccount(
+    account: string,
+    offset: number,
+    limit: number,
+  ): Promise<PaymentRecord[]> {
+    try {
+      const v = await this.call(
+        'get_payments_by_account', addr(account), u64(offset), u64(limit),
+      );
+      if (Array.isArray(v)) return (v as Native[]).map(mapPaymentRecord);
+    } catch {
+      // Method not available on this contract version; fall through.
+    }
+    return this.derivePaymentsFromJobs(account, offset, limit);
+  }
+
+  /** Build payment records from a client's jobs and their linked escrows. */
+  private async derivePaymentsFromJobs(
+    account: string,
+    offset: number,
+    limit: number,
+  ): Promise<PaymentRecord[]> {
+    const jobIds = await this.getJobsByClient(account, offset, limit);
+    const records = await Promise.all(
+      jobIds.map(async (jobId): Promise<PaymentRecord | null> => {
+        const escrow = await this.getEscrowByJob(jobId);
+        if (!escrow) return null;
+        return {
+          jobId,
+          account,
+          amount: escrow.amount,
+          fee: 0,
+          token: escrow.token,
+          txHash: null,
+          createdAt: escrow.createdAt,
+        };
+      }),
+    );
+    return records.filter((r): r is PaymentRecord => r !== null);
   }
 
   // ── stats ──────────────────────────────────────────────────────────────────

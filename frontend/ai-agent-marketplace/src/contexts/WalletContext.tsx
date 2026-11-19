@@ -13,6 +13,49 @@ const getHorizonUrl = (network: string | null) =>
     ? 'https://horizon.stellar.org'
     : 'https://horizon-testnet.stellar.org';
 
+// ---------------------------------------------------------------------------
+// Compliance: sanctions screening & region restrictions
+// ---------------------------------------------------------------------------
+// The blocklist is configurable at build time via environment variables so it
+// can be updated without a code change:
+//   VITE_BLOCKED_ADDRESSES  comma-separated Stellar public keys (G...)
+//   VITE_BLOCKED_REGIONS    comma-separated ISO 3166-1 alpha-2 region codes
+//                           (e.g. "KP,IR,SY")
+// Addresses are compared case-insensitively; regions are upper-cased.
+// ---------------------------------------------------------------------------
+
+const parseList = (raw: string | undefined | null): string[] =>
+  (raw ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+const BLOCKED_ADDRESSES: string[] = parseList(
+  import.meta.env?.VITE_BLOCKED_ADDRESSES,
+).map((address) => address.toUpperCase());
+
+const BLOCKED_REGIONS: string[] = parseList(
+  import.meta.env?.VITE_BLOCKED_REGIONS,
+).map((region) => region.toUpperCase());
+
+/** Returns true when the given Stellar address is on the compliance blocklist. */
+export const isAddressBlocked = (address: string | null | undefined): boolean => {
+  if (!address) return false;
+  return BLOCKED_ADDRESSES.includes(address.trim().toUpperCase());
+};
+
+/** Returns true when the given region code is restricted. */
+export const isRegionBlocked = (region: string | null | undefined): boolean => {
+  if (!region) return false;
+  return BLOCKED_REGIONS.includes(region.trim().toUpperCase());
+};
+
+/** The configured blocklists, exposed for UI display / debugging. */
+export const getComplianceLists = () => ({
+  blockedAddresses: [...BLOCKED_ADDRESSES],
+  blockedRegions: [...BLOCKED_REGIONS],
+});
+
 interface Balances {
   /** Native XLM balance as a decimal string, e.g. "9.9999900" */
   xlmBalance: string;
@@ -64,6 +107,10 @@ interface WalletState {
   usdcBalance: string;
   isLoading: boolean;
   availableNetworks: string[];
+  /** True when the connected wallet address is on the compliance blocklist */
+  isBlocked: boolean;
+  /** Human-readable reason when the wallet is blocked, otherwise null */
+  blockedReason: string | null;
 }
 
 interface WalletContextType extends WalletState {
@@ -74,6 +121,9 @@ interface WalletContextType extends WalletState {
   switchNetwork: (network: string) => Promise<void>;
   refreshBalance: () => Promise<void>;
   isFreighterInstalled: boolean;
+  /** Compliance helpers usable before posting or bidding */
+  isAddressBlocked: (address: string | null | undefined) => boolean;
+  isRegionBlocked: (region: string | null | undefined) => boolean;
 }
 
 const WalletContext = createContext<WalletContextType | null>(null);
@@ -93,6 +143,8 @@ const INITIAL_STATE: WalletState = {
   usdcBalance: '0',
   isLoading: false,
   availableNetworks: ['TESTNET', 'PUBLIC'],
+  isBlocked: false,
+  blockedReason: null,
 };
 
 export const WalletProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -106,10 +158,15 @@ export const WalletProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       if (isConnected) {
         const publicKey = await freighter.getPublicKey();
         if (publicKey) {
+          const blocked = isAddressBlocked(publicKey);
           setState((prev) => ({
             ...prev,
             publicKey,
             isConnected: true,
+            isBlocked: blocked,
+            blockedReason: blocked
+              ? 'This wallet address is restricted by compliance policy.'
+              : null,
           }));
         }
       }
@@ -127,6 +184,7 @@ export const WalletProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     try {
       const publicKey = await freighter.getPublicKey();
       const { xlmBalance, usdcBalance } = await fetchBalances(publicKey, state.network);
+      const blocked = isAddressBlocked(publicKey);
       setState((prev) => ({
         ...prev,
         publicKey,
@@ -134,6 +192,10 @@ export const WalletProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         usdcBalance,
         isConnected: true,
         isConnecting: false,
+        isBlocked: blocked,
+        blockedReason: blocked
+          ? 'This wallet address is restricted by compliance policy.'
+          : null,
       }));
     } catch (err) {
       console.error('Failed to connect Freighter wallet:', err);
@@ -187,6 +249,8 @@ export const WalletProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         switchNetwork,
         refreshBalance,
         isFreighterInstalled,
+        isAddressBlocked,
+        isRegionBlocked,
       }}
     >
       {children}

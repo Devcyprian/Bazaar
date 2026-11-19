@@ -26,6 +26,7 @@ import {
   isIpfsConfigured,
   type UploadProgress,
 } from '@/lib/ipfs';
+import { isAddressBlocked } from '@/lib/compliance';
 
 /**
  * Number of days after escrow creation beyond which the client may reclaim
@@ -105,10 +106,30 @@ export const JobDetail: React.FC = () => {
     enabled: !!jobIdNum,
   });
 
+  // ── compliance: sanctions / region blocklist ───────────────────────────────
+  const {
+    data: isBlocked = false,
+    isLoading: isBlocklistLoading,
+  } = useQuery<boolean>({
+    queryKey: ['compliance-blocked', publicKey],
+    queryFn: async () => {
+      if (!publicKey) return false;
+      const client = getContractClient();
+      return isAddressBlocked(publicKey, client);
+    },
+    enabled: !!publicKey,
+  });
+
   // ── derived state ──────────────────────────────────────────────────────────
   const isClient = publicKey === job?.client;
   const isAssignedAgent = publicKey === job?.assignedAgent;
-  const canBid = isConnected && !isClient && job?.status === 'Open' && !isAssignedAgent;
+  const canBid =
+    isConnected &&
+    !isClient &&
+    job?.status === 'Open' &&
+    !isAssignedAgent &&
+    !isBlocked &&
+    !isBlocklistLoading;
 
   // ── action handlers (sign + submit real Soroban transactions) ─────────────
   const handleBid = async () => {
@@ -116,6 +137,22 @@ export const JobDetail: React.FC = () => {
     const client = getContractClient();
     if (!client) {
       alert('Not connected to the marketplace contract. Configure it in Settings.');
+      return;
+    }
+    // Compliance: re-check the blocklist right before submitting so a stale
+    // cache cannot let a blocked address post a bid.
+    try {
+      if (await isAddressBlocked(publicKey, client)) {
+        alert(
+          'Compliance error: your wallet address is blocked from participating in this marketplace. ' +
+            'Bidding is not permitted. Contact support if you believe this is a mistake.',
+        );
+        await queryClient.invalidateQueries({ queryKey: ['compliance-blocked', publicKey] });
+        return;
+      }
+    } catch (err) {
+      console.error('Compliance check failed:', err);
+      alert('Unable to verify compliance status. Please try again later.');
       return;
     }
     setIsActing(true);
@@ -444,12 +481,33 @@ export const JobDetail: React.FC = () => {
           </div>
         </div>
 
+        {/* ── Compliance notice ── */}
+        {isBlocked && (
+          <div className="mb-6 flex items-start gap-3 p-4 bg-destructive/10 border border-destructive/20 rounded-lg">
+            <Shield className="h-5 w-5 text-destructive flex-shrink-0 mt-0.5" />
+            <div className="text-sm">
+              <p className="font-medium text-destructive">Address blocked</p>
+              <p className="text-muted-foreground mt-0.5">
+                Your connected wallet is on the compliance blocklist and cannot post jobs or place
+                bids on this marketplace. Contact support if you believe this is a mistake.
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* ── Action Buttons ── */}
         <div className="flex flex-wrap gap-3 mb-8">
           {job.status === 'Open' && canBid && (
             <Button onClick={() => setShowBidModal(true)} className="flex-1 sm:flex-none">
               <Send className="h-4 w-4 mr-2" />
               Place Bid
+            </Button>
+          )}
+
+          {job.status === 'Open' && isConnected && !isClient && !isAssignedAgent && isBlocked && (
+            <Button disabled className="flex-1 sm:flex-none">
+              <Shield className="h-4 w-4 mr-2" />
+              Bidding Blocked
             </Button>
           )}
 
@@ -771,6 +829,11 @@ export const JobDetail: React.FC = () => {
                         Place First Bid
                       </Button>
                     )}
+                    {isBlocked && (
+                      <p className="text-sm text-destructive mt-4">
+                        Your wallet address is blocked from bidding.
+                      </p>
+                    )}
                   </div>
                 ) : (
                   <div className="divide-y">
@@ -980,7 +1043,7 @@ export const JobDetail: React.FC = () => {
                 <Button
                   onClick={handleBid}
                   className="flex-1"
-                  disabled={!bidAmount || !bidTimeline || !bidProposal || isActing}
+                  disabled={!bidAmount || !bidTimeline || !bidProposal || isActing || isBlocked}
                   isLoading={isActing}
                 >
                   Submit Bid

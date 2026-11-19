@@ -108,3 +108,46 @@ export interface Escrow {
   disputeRaisedAt: number | null;
   resolver: string | null;
 }
+
+/**
+ * A single payment/escrow movement for an account, used by the Dashboard CSV
+ * export. `amount` and `fee` are raw token base units (apply the token's
+ * decimals when formatting for display/export).
+ */
+export interface PaymentRecord {
+  jobId: number;
+  amount: number;
+  fee: number;
+  txHash: string;
+  /** Unix timestamp (seconds) the payment was recorded. */
+  createdAt: number;
+  status: EscrowStatus;
+}
+
+/**
+ * A denylisted address. Managed by the admin multisig on-chain (or via the
+ * frontend blocklist config) so entries can be added/removed without a
+ * redeploy.
+ */
+export interface DenylistEntry {
+  address: string;
+  /** Human-readable reason for the block (e.g. sanctions match). */
+  reason: string;
+  /** Unix timestamp (seconds) the entry was added. */
+  addedAt: number;
+}
+
+/**
+ * Frontend compliance configuration: the set of blocked addresses and
+ * restricted regions used to gate posting and bidding.
+ */
+export interface ComplianceConfig {
+  /** Addresses that may not post jobs or place bids. */
+  blockedAddresses: string[];
+  /** ISO 3166-1 alpha-2 region codes that are restricted. */
+  restrictedRegions: string[];
+  /** Full denylist entries with metadata, when available. */
+  denylist: DenylistEntry[];
+  /** Whether the compliance check is enforced. */
+  enabled: boolean;
+}
