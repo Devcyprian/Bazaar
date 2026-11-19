@@ -375,6 +375,9 @@ function mapPlatformStats(raw: Native): PlatformStats {
     totalFeesCollected: toNum(raw.total_fees_collected),
     totalDisputes: toNum(raw.total_disputes),
     avgJobCompletionTime: toNum(raw.avg_job_completion_time),
+    // Live counters (default 0 for contracts predating these fields).
+    openJobs: toNum(raw.open_jobs),
+    activeAgents: toNum(raw.active_agents),
   };
 }
 

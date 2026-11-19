@@ -126,6 +126,10 @@ export interface PlatformStats {
   totalFeesCollected: number;
   totalDisputes: number;
   avgJobCompletionTime: number;
+  /** Number of jobs currently in the `Open` status (on-chain `open_jobs`). */
+  openJobs: number;
+  /** Number of agents currently active (on-chain `active_agents`). */
+  activeAgents: number;
 }
 
 export interface Escrow {

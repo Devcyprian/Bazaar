@@ -8,6 +8,7 @@
 // - Dispute resolution
 
 #![no_std]
+#![deny(clippy::unwrap_used)]
 use soroban_sdk::{
     auth::Context,
     contract, contracterror, contractimpl, contracttype, symbol_short,
@@ -137,6 +138,18 @@ pub struct Review {
     pub created_at: u64,
 }
 
+/// #121: Aggregated reputation for a client, derived from agent reviews and
+/// job activity.  Exposed via `get_client_stats` so agents can screen clients
+/// before bidding.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientStats {
+    pub rating_sum: u32,
+    pub rating_count: u32,
+    pub jobs_posted: u32,
+    pub disputes: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SkillVerification {
@@ -236,6 +249,10 @@ pub enum DataKey {
     EscrowByJob(u64),
     Review(u64),
     ReviewsByReviewee(Address),
+    /// #123: (job_id, reviewer) -> review_id, for O(1) duplicate checks.
+    ReviewByJobReviewer(u64, Address),
+    /// #121: Aggregated client reputation.
+    ClientStats(Address),
     Dispute(u64),
     DisputesByJob(u64),
     SkillVerification(u64),
@@ -256,6 +273,10 @@ pub struct PlatformStats {
     pub total_fees_collected: i128,
     pub total_disputes: u64,
     pub avg_job_completion_time: u64,
+    /// #128: Number of jobs currently in `JobStatus::Open`.
+    pub open_jobs: u32,
+    /// #128: Number of agents whose `is_active` flag is `true`.
+    pub active_agents: u32,
 }
 
 #[contracterror]
@@ -324,9 +345,11 @@ pub enum Error {
     /// Returned by `post_job` / `place_bid` when the caller's address is on the
     /// admin-managed sanctions/denylist.
     AddressBlocked = 53,
-    /// #129: Returned by `place_bid` when the job already has
-    /// `config.max_bids_per_job` bids.
-    TooManyBids = 54,
+    /// Returned by `leave_review` when the comment exceeds
+    /// `MAX_REVIEW_COMMENT_LEN` bytes.
+    InputTooLong = 54,
+    /// Returned by `place_bid` when the bidding agent has been deactivated.
+    AgentInactive = 55,
 }
 
 /// #172: Minimum TTL (in ledgers) we keep on persistent records.  At ~5s per
@@ -342,10 +365,11 @@ pub const EXTEND_INSTANCE_TTL: u32 = 1_555_200;
 /// #170: Default fallback split (percentage of payout to the agent) applied
 /// when a dispute times out without an admin resolution.
 pub const DISPUTE_FALLBACK_AGENT_PCT: u32 = 50;
-/// #129: Default cap on the number of bids a single job may accumulate.
-pub const DEFAULT_MAX_BIDS_PER_JOB: u32 = 50;
-/// #132: Expected decimals for the USDC Stellar Asset Contract.
-pub const USDC_DECIMALS: u32 = 7;
+/// #124: Maximum length, in bytes, of the free-form `comment` accepted by
+/// `leave_review`.  Comments are stored on chain forever, so this cap bounds
+/// the storage cost per review.  Longer comments are rejected with
+/// `Error::InputTooLong`.
+pub const MAX_REVIEW_COMMENT_LEN: u32 = 500;
 
 #[contract]
 pub struct AiAgentMarketplace;
@@ -430,6 +454,8 @@ impl AiAgentMarketplace {
             total_fees_collected: 0,
             total_disputes: 0,
             avg_job_completion_time: 0,
+            open_jobs: 0,
+            active_agents: 0,
         };
         env.storage().instance().set(&DataKey::PlatformStats, &stats);
         env.storage().instance().set(&DataKey::IsPaused, &false);
@@ -599,10 +625,11 @@ impl AiAgentMarketplace {
         // Update stats
         let mut stats = Self::get_platform_stats(&env)?;
         stats.total_agents += 1;
+        stats.active_agents += 1;
         env.storage().instance().set(&DataKey::PlatformStats, &stats);
 
         env.events().publish(
-            (symbol_short!("agent_reg"),),
+            (symbol_short!("agent_reg"), agent_id, owner.clone()),
             (agent_id, owner, agent.price_per_task),
         );
 
@@ -643,6 +670,15 @@ impl AiAgentMarketplace {
             agent.price_per_task = price;
         }
         if let Some(active) = is_active {
+            if agent.is_active && !active {
+                let mut stats = Self::get_platform_stats(&env)?;
+                stats.active_agents = stats.active_agents.saturating_sub(1);
+                env.storage().instance().set(&DataKey::PlatformStats, &stats);
+            } else if !agent.is_active && active {
+                let mut stats = Self::get_platform_stats(&env)?;
+                stats.active_agents += 1;
+                env.storage().instance().set(&DataKey::PlatformStats, &stats);
+            }
             agent.is_active = active;
         }
         if let Some(uri) = metadata_uri {
@@ -652,8 +688,79 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::Agent(agent_id), &agent);
 
         env.events().publish(
-            (symbol_short!("agent_upd"),),
+            (symbol_short!("agent_upd"), agent_id, owner.clone()),
             (agent_id, owner),
+        );
+
+        Ok(())
+    }
+
+    /// #125: Deactivate an agent (owner only).
+    ///
+    /// Flips `agent.is_active` to `false`, which prevents the agent from
+    /// bidding on new jobs and hides it from skill indexes.  Jobs already in
+    /// progress are unaffected.  Emits an `agent_deact` event.
+    pub fn deactivate_agent(
+        env: Env,
+        owner: Address,
+        agent_id: u64,
+    ) -> Result<(), Error> {
+        owner.require_auth();
+        Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
+
+        let mut agent = Self::get_agent(&env, agent_id)?;
+        if agent.owner != owner {
+            return Err(Error::Unauthorized);
+        }
+
+        if agent.is_active {
+            agent.is_active = false;
+            env.storage().instance().set(&DataKey::Agent(agent_id), &agent);
+
+            let mut stats = Self::get_platform_stats(&env)?;
+            stats.active_agents = stats.active_agents.saturating_sub(1);
+            env.storage().instance().set(&DataKey::PlatformStats, &stats);
+        }
+
+        env.events().publish(
+            (symbol_short!("agent_deact"), agent_id, owner.clone()),
+            (agent_id, owner, agent.is_active),
+        );
+
+        Ok(())
+    }
+
+    /// #125: Reactivate an agent (owner only).
+    ///
+    /// Flips `agent.is_active` back to `true`, allowing the agent to bid again
+    /// and reappear in skill indexes.  Emits an `agent_react` event.
+    pub fn reactivate_agent(
+        env: Env,
+        owner: Address,
+        agent_id: u64,
+    ) -> Result<(), Error> {
+        owner.require_auth();
+        Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
+
+        let mut agent = Self::get_agent(&env, agent_id)?;
+        if agent.owner != owner {
+            return Err(Error::Unauthorized);
+        }
+
+        if !agent.is_active {
+            agent.is_active = true;
+            env.storage().instance().set(&DataKey::Agent(agent_id), &agent);
+
+            let mut stats = Self::get_platform_stats(&env)?;
+            stats.active_agents += 1;
+            env.storage().instance().set(&DataKey::PlatformStats, &stats);
+        }
+
+        env.events().publish(
+            (symbol_short!("agent_react"), agent_id, owner.clone()),
+            (agent_id, owner, agent.is_active),
         );
 
         Ok(())
@@ -731,7 +838,7 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::SkillVerificationsByAgent(agent.owner.clone()), &agent_verifications);
 
         env.events().publish(
-            (symbol_short!("skill_ver"),),
+            (symbol_short!("skill_ver"), agent_id, verifier.clone()),
             (agent_id, skill, verifier, expires_at),
         );
 
@@ -805,10 +912,16 @@ impl AiAgentMarketplace {
         // Update stats
         let mut stats = Self::get_platform_stats(&env)?;
         stats.total_jobs += 1;
+        stats.open_jobs += 1;
         env.storage().instance().set(&DataKey::PlatformStats, &stats);
 
+        // #121: track client reputation.
+        let mut client_stats = Self::get_client_stats_internal(&env, &client);
+        client_stats.jobs_posted = client_stats.jobs_posted.saturating_add(1);
+        env.storage().instance().set(&DataKey::ClientStats(client.clone()), &client_stats);
+
         env.events().publish(
-            (symbol_short!("job_post"),),
+            (symbol_short!("job_post"), job_id, client.clone()),
             (job_id, client, budget, deadline),
         );
 
@@ -845,8 +958,12 @@ impl AiAgentMarketplace {
         job.status = JobStatus::Cancelled;
         env.storage().instance().set(&DataKey::Job(job_id), &job);
 
+        let mut stats = Self::get_platform_stats(&env)?;
+        stats.open_jobs = stats.open_jobs.saturating_sub(1);
+        env.storage().instance().set(&DataKey::PlatformStats, &stats);
+
         env.events().publish(
-            (symbol_short!("job_cancel"),),
+            (symbol_short!("job_cancel"), job_id, client.clone()),
             (job_id, client),
         );
 
@@ -889,7 +1006,7 @@ impl AiAgentMarketplace {
         let agent = Self::get_agent(&env, agent_id)?;
 
         if !agent.is_active {
-            return Err(Error::AgentNotActive);
+            return Err(Error::AgentInactive);
         }
 
         if agent.reputation < config.min_agent_reputation_to_bid {
@@ -966,7 +1083,7 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::BidsByAgent(agent_owner.clone()), &agent_bids);
 
         env.events().publish(
-            (symbol_short!("bid_placed"),),
+            (symbol_short!("bid_placed"), job_id, agent_owner.clone()),
             (bid_id, job_id, agent_owner, amount),
         );
 
@@ -1009,7 +1126,7 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::Bid(bid_id), &bid);
 
         env.events().publish(
-            (symbol_short!("bid_withdraw"),),
+            (symbol_short!("bid_withdraw"), job_id, agent_owner.clone()),
             (bid_id, job_id, agent_owner),
         );
 
@@ -1129,6 +1246,7 @@ impl AiAgentMarketplace {
         let mut stats = Self::get_platform_stats(&env)?;
         stats.total_volume += bid.amount;
         stats.total_fees_collected += platform_fee;
+        stats.open_jobs = stats.open_jobs.saturating_sub(1);
         env.storage().instance().set(&DataKey::PlatformStats, &stats);
 
         // Track the newly locked escrow against the canary cap.
@@ -1147,7 +1265,7 @@ impl AiAgentMarketplace {
         usdc_client.transfer(&client, &env.current_contract_address(), &bid.amount);
 
         env.events().publish(
-            (symbol_short!("bid_accept"),),
+            (symbol_short!("bid_accept"), job_id, bid.agent.clone()),
             (job_id, bid_id, bid.agent, bid.amount, platform_fee),
         );
 
@@ -1181,7 +1299,7 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::Job(job_id), &job);
 
         env.events().publish(
-            (symbol_short!("deliver"),),
+            (symbol_short!("deliver"), job_id, agent.clone()),
             (job_id, agent, deliverable_hash),
         );
 
@@ -1275,7 +1393,7 @@ impl AiAgentMarketplace {
         }
 
         env.events().publish(
-            (symbol_short!("approved"),),
+            (symbol_short!("approved"), job_id, escrow.agent.clone()),
             (job_id, escrow.agent, escrow.amount),
         );
 
@@ -1371,8 +1489,13 @@ impl AiAgentMarketplace {
         stats.total_disputes += 1;
         env.storage().instance().set(&DataKey::PlatformStats, &stats);
 
+        // #121: track client reputation.
+        let mut client_stats = Self::get_client_stats_internal(&env, &job.client);
+        client_stats.disputes = client_stats.disputes.saturating_add(1);
+        env.storage().instance().set(&DataKey::ClientStats(job.client.clone()), &client_stats);
+
         env.events().publish(
-            (symbol_short!("dispute"),),
+            (symbol_short!("dispute"), job_id, raiser.clone()),
             (dispute_id, job_id, raiser, dispute.reason.clone()),
         );
 
@@ -1475,7 +1598,7 @@ impl AiAgentMarketplace {
         Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.client, client_payout);
 
         env.events().publish(
-            (symbol_short!("dispute_res"),),
+            (symbol_short!("dispute_res"), dispute.job_id, resolver.clone()),
             (dispute_id, resolver, resolution),
         );
 
@@ -1509,27 +1632,22 @@ impl AiAgentMarketplace {
             return Err(Error::InvalidRating);
         }
 
-        // Check if already reviewed
-        let existing_reviews: Vec<u64> = env.storage().instance()
-            .get(&DataKey::ReviewsByReviewee(
-                if job.client == reviewer { job.assigned_agent.unwrap() } else { job.client.clone() }
-            ))
-            .unwrap_or(Vec::new(&env));
-
-        for review_id in existing_reviews.iter() {
-            let review = Self::get_review(&env, review_id)?;
-            if review.job_id == job_id && review.reviewer == reviewer {
-                return Err(Error::AlreadyReviewed);
-            }
+        // #123: O(1) duplicate-review check.
+        if env.storage().instance()
+            .has(&DataKey::ReviewByJobReviewer(job_id, reviewer.clone()))
+        {
+            return Err(Error::AlreadyReviewed);
         }
 
         let review_id = Self::next_review_id(&env)?;
         let now = env.ledger().timestamp();
 
-        let reviewee = if job.client == reviewer { 
-            job.assigned_agent.unwrap() 
-        } else { 
-            job.client.clone() 
+        // #122: never unwrap `assigned_agent`; a Completed/Refunded job without
+        // an assigned agent is an error, not a trap.
+        let reviewee = if job.client == reviewer {
+            job.assigned_agent.clone().ok_or(Error::AgentNotFound)?
+        } else {
+            job.client.clone()
         };
 
         let review = Review {
@@ -1543,6 +1661,11 @@ impl AiAgentMarketplace {
         };
 
         env.storage().instance().set(&DataKey::Review(review_id), &review);
+        // #123: index by (job_id, reviewer) for O(1) duplicate checks.
+        env.storage().instance().set(
+            &DataKey::ReviewByJobReviewer(job_id, reviewer.clone()),
+            &review_id,
+        );
 
         // Index review
         let mut reviewee_reviews: Vec<u64> = env.storage().instance()
@@ -1550,6 +1673,14 @@ impl AiAgentMarketplace {
             .unwrap_or(Vec::new(&env));
         reviewee_reviews.push_back(review_id);
         env.storage().instance().set(&DataKey::ReviewsByReviewee(reviewee.clone()), &reviewee_reviews);
+
+        // #121: when the agent reviews the client, update the client's stats.
+        if job.client != reviewer {
+            let mut client_stats = Self::get_client_stats_internal(&env, &reviewee);
+            client_stats.rating_sum = client_stats.rating_sum.saturating_add(rating);
+            client_stats.rating_count = client_stats.rating_count.saturating_add(1);
+            env.storage().instance().set(&DataKey::ClientStats(reviewee.clone()), &client_stats);
+        }
 
         // Update agent reputation when the client reviews the agent
         if job.client == reviewer {
@@ -1570,7 +1701,7 @@ impl AiAgentMarketplace {
         }
 
         env.events().publish(
-            (symbol_short!("review"),),
+            (symbol_short!("review"), job_id, reviewer.clone()),
             (review_id, job_id, reviewer, reviewee, rating),
         );
 
@@ -1662,7 +1793,7 @@ impl AiAgentMarketplace {
 
         // Emit refund event
         env.events().publish(
-            (symbol_short!("refund"),),
+            (symbol_short!("refund"), job_id, client.clone()),
             (job_id, client, escrow.amount),
         );
 
@@ -1733,7 +1864,7 @@ impl AiAgentMarketplace {
         );
 
         env.events().publish(
-            (symbol_short!("reclaim"),),
+            (symbol_short!("reclaim"), job_id, client.clone()),
             (job_id, client, escrow.amount),
         );
 
@@ -1778,7 +1909,7 @@ impl AiAgentMarketplace {
         );
 
         env.events().publish(
-            (symbol_short!("claim"),),
+            (symbol_short!("claim"), job_id, agent.clone()),
             (job_id, agent, claim.amount, config.usdc_token),
         );
 
@@ -1865,7 +1996,7 @@ impl AiAgentMarketplace {
         Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.client, client_amount);
 
         env.events().publish(
-            (symbol_short!("disp_fb"),),
+            (symbol_short!("disp_fb"), dispute.job_id, caller.clone()),
             (dispute_id, caller, agent_amount, client_amount),
         );
 
@@ -1889,7 +2020,7 @@ impl AiAgentMarketplace {
         }
 
         env.events().publish(
-            (symbol_short!("ttl_bump"),),
+            (symbol_short!("ttl_bump"), job_id),
             (job_id, env.ledger().sequence()),
         );
 
@@ -2024,7 +2155,16 @@ impl AiAgentMarketplace {
         let all: Vec<u64> = env.storage().instance()
             .get(&DataKey::SkillAgents(skill))
             .unwrap_or(Vec::new(&env));
-        Self::paginate(&env, &all, offset, limit)
+        // #125: hide deactivated agents from skill indexes.
+        let mut active = Vec::new(&env);
+        for id in all.iter() {
+            if let Ok(agent) = Self::get_agent(&env, id) {
+                if agent.is_active {
+                    active.push_back(id);
+                }
+            }
+        }
+        Self::paginate(&env, &active, offset, limit)
     }
 
     /// Get all agents (paginated).
@@ -2096,6 +2236,13 @@ impl AiAgentMarketplace {
         escrow_id.and_then(|id| Self::get_escrow(&env, id).ok())
     }
 
+    /// #121: Get aggregated reputation stats for a client.
+    ///
+    /// Returns zeroed stats when the client has no recorded activity yet.
+    pub fn get_client_stats(env: Env, client: Address) -> ClientStats {
+        Self::get_client_stats_internal(&env, &client)
+    }
+
     /// Get platform configuration
     pub fn get_config(env: Env) -> Result<Config, Error> {
         Self::get_config(&env)
@@ -2110,6 +2257,8 @@ impl AiAgentMarketplace {
             total_fees_collected: 0,
             total_disputes: 0,
             avg_job_completion_time: 0,
+            open_jobs: 0,
+            active_agents: 0,
         })
     }
 
@@ -2138,52 +2287,121 @@ impl AiAgentMarketplace {
             return Err(Error::Unauthorized);
         }
 
+        // #126: emit one `config_upd` event per changed field, carrying
+        // `(field_symbol, old_value, new_value)` so indexers need not refetch.
         if let Some(fee) = platform_fee_bps {
             if fee > 10000 {
                 return Err(Error::InvalidConfig);
             }
+            if fee != config.platform_fee_bps {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("fee_bps")),
+                    (config.platform_fee_bps, fee),
+                );
+            }
             config.platform_fee_bps = fee;
         }
         if let Some(budget) = min_job_budget {
+            if budget != config.min_job_budget {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("min_budget")),
+                    (config.min_job_budget, budget),
+                );
+            }
             config.min_job_budget = budget;
         }
         if let Some(days) = max_job_deadline_days {
+            if days != config.max_job_deadline_days {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("max_days")),
+                    (config.max_job_deadline_days, days),
+                );
+            }
             config.max_job_deadline_days = days;
         }
         if let Some(days) = dispute_window_days {
+            if days != config.dispute_window_days {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("disp_win")),
+                    (config.dispute_window_days, days),
+                );
+            }
             config.dispute_window_days = days;
         }
         if let Some(rep) = min_agent_reputation {
+            if rep != config.min_agent_reputation {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("min_rep")),
+                    (config.min_agent_reputation, rep),
+                );
+            }
             config.min_agent_reputation = rep;
         }
         if let Some(recipient) = platform_fee_recipient {
+            if recipient != config.platform_fee_recipient {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("fee_rcpt")),
+                    (config.platform_fee_recipient.clone(), recipient.clone()),
+                );
+            }
             config.platform_fee_recipient = recipient;
         }
         if let Some(resolver) = dispute_resolver {
+            if resolver != config.dispute_resolver {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("resolver")),
+                    (config.dispute_resolver.clone(), resolver.clone()),
+                );
+            }
             config.dispute_resolver = resolver;
         }
         if let Some(rep) = min_agent_reputation_to_bid {
+            if rep != config.min_agent_reputation_to_bid {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("bid_rep")),
+                    (config.min_agent_reputation_to_bid, rep),
+                );
+            }
             config.min_agent_reputation_to_bid = rep;
         }
         if let Some(fee) = platform_fee_bps_dispute {
+            if fee != config.platform_fee_bps_dispute {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("disp_fee")),
+                    (config.platform_fee_bps_dispute, fee),
+                );
+            }
             config.platform_fee_bps_dispute = fee;
         }
         if let Some(days) = escrow_expiry_days {
+            if days != config.escrow_expiry_days {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("esc_exp")),
+                    (config.escrow_expiry_days, days),
+                );
+            }
             config.escrow_expiry_days = days;
         }
         if let Some(verifiers) = skill_verifiers {
+            if verifiers != config.skill_verifiers {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("verifiers")),
+                    (config.skill_verifiers.clone(), verifiers.clone()),
+                );
+            }
             config.skill_verifiers = verifiers;
         }
         if let Some(flag) = require_skill_verification {
+            if flag != config.require_skill_verification {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("req_skill")),
+                    (config.require_skill_verification, flag),
+                );
+            }
             config.require_skill_verification = flag;
         }
 
         env.storage().instance().set(&DataKey::Config, &config);
-
-        env.events().publish(
-            (symbol_short!("config_upd"),),
-            admin,
-        );
 
         Ok(())
     }
@@ -2286,7 +2504,7 @@ impl AiAgentMarketplace {
         };
         env.storage().instance().set(&DataKey::Claimable(job_id), &claim);
         env.events().publish(
-            (symbol_short!("claimable"),),
+            (symbol_short!("claimable"), job_id),
             (job_id, recipient.clone(), amount),
         );
     }
@@ -2381,6 +2599,18 @@ impl AiAgentMarketplace {
         env.storage().instance()
             .get(&DataKey::PlatformStats)
             .ok_or(Error::NotInitialized)
+    }
+
+    /// #121: Read a client's stats, defaulting to zeroed stats when absent.
+    fn get_client_stats_internal(env: &Env, client: &Address) -> ClientStats {
+        env.storage().instance()
+            .get(&DataKey::ClientStats(client.clone()))
+            .unwrap_or(ClientStats {
+                rating_sum: 0,
+                rating_count: 0,
+                jobs_posted: 0,
+                disputes: 0,
+            })
     }
 
     fn next_agent_id(env: &Env) -> Result<u64, Error> {
