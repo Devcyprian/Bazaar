@@ -163,6 +163,25 @@ echo -e "${GREEN}✅ WASM hash verified${NC}"
 echo "$CONTRACT_ID" > ".contract-id-$NETWORK"
 echo -e "${GREEN}📝 Contract ID saved to .contract-id-$NETWORK${NC}"
 
+# Initialize immediately in the same session (issue #102).
+# initialize() requires auth from the admin, so the admin must sign this
+# transaction. Running it right after deploy closes the front-running window
+# where an attacker could otherwise call initialize() first and choose the
+# admin, fee recipient, resolver and token.
+if [ "$MODE" = "deploy" ]; then
+    echo ""
+    echo -e "${YELLOW}🔐 Initializing contract (same session, admin must sign)...${NC}"
+    echo "  Admin source: $SOURCE_ACCOUNT ($SOURCE_ADDRESS)"
+    if ! ./scripts/init-contract.sh "$NETWORK" "$SOURCE_ACCOUNT"; then
+        echo -e "${RED}❌ Initialization failed.${NC}"
+        echo -e "${RED}⚠️  The contract is deployed but NOT initialized.${NC}"
+        echo -e "${RED}⚠️  Run ./scripts/init-contract.sh $NETWORK $SOURCE_ACCOUNT IMMEDIATELY.${NC}"
+        echo -e "${RED}⚠️  Until then anyone can front-run initialize() and seize admin control.${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✅ Contract initialized${NC}"
+fi
+
 echo ""
 echo -e "${GREEN}🎉 Deployment complete!${NC}"
 echo -e "${GREEN}📝 Deployment log saved to $LOG_FILE${NC}"
@@ -171,15 +190,16 @@ echo -e "${YELLOW}📋 Post-deploy verification checklist (record results for th
 echo "  [ ] Contract ID: $CONTRACT_ID"
 echo "  [ ] Admin set to multisig account: $SOURCE_ACCOUNT"
 echo "  [ ] WASM hash matches local artifact: $LOCAL_WASM_HASH"
+echo "  [ ] initialize() executed in the SAME session as deploy (no gap)"
+echo "  [ ] initialize() transaction signed by the admin account"
 echo "  [ ] Caps configured and verified on-chain"
 echo "  [ ] Pause drill completed (admin can pause and unpause)"
 echo "  [ ] Upgrade drill completed (admin can upgrade to new WASM)"
 echo "  [ ] Reconciliation of balances/state against expected values"
 echo ""
 echo "Next steps:"
-echo "1. Initialize contract: ./scripts/init-contract.sh $NETWORK"
-echo "2. Update frontend .env.local with contract ID"
-echo "3. Deploy frontend: ./scripts/deploy-frontend.sh"
-echo "4. Schedule the TTL keeper to keep escrow/job entries alive:"
+echo "1. Update frontend .env.local with contract ID"
+echo "2. Deploy frontend: ./scripts/deploy-frontend.sh"
+echo "3. Schedule the TTL keeper to keep escrow/job entries alive:"
 echo "   ./scripts/keeper.sh $NETWORK"
 echo "   (run periodically via cron or a systemd timer, e.g. every 12 hours)"

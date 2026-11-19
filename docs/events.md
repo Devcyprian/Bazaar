@@ -73,9 +73,22 @@ To filter by a specific job id, match the second topic segment against the job i
 
 | Event | Topics `(symbol, id[, address])` | Data payload |
 |-------|----------------------------------|--------------|
-| `disp_open` | `(disp_open, dispute_id, job_id)` | dispute reason, opener, etc. |
+| `disp_open` | `(disp_open, dispute_id, job_id)` | dispute id, job id, and a hash of the reason/evidence (constant size) |
 | `disp_res` | `(disp_res, dispute_id)` | resolution outcome, amounts |
 | `disp_esc` | `(disp_esc, dispute_id)` | escalation details |
+| `disp_timeout` | `(disp_timeout, dispute_id, job_id)` | dispute id, job id, and the fallback outcome (split or refund) |
+
+#### `disp_open` payload
+
+`disp_open` no longer carries the dispute reason or evidence URI text. The data payload contains only the dispute id, the job id, and a hash of the reason/evidence, so the payload size is constant regardless of how long the submitted text is. The full reason and evidence URI are stored only in the dispute record and can be read from contract storage.
+
+#### `disp_timeout` payload
+
+`disp_timeout` is emitted by `claim_after_resolver_timeout(dispute_id)` when the configured resolution deadline passes without the assigned resolver acting. Anyone may trigger it after the deadline. The payload contains the dispute id, the job id, and the fallback outcome (configurable split or refund), and is constant size.
+
+#### Resolver assignment
+
+Disputes are assigned to one of the configured resolvers (managed by the admin). Only the assigned resolver or the admin can resolve a dispute; the assignment is recorded on the dispute record.
 
 ## Migration Notes
 

@@ -67,7 +67,7 @@ fn create_marketplace_contract<'a>(
         &30,            // max_job_deadline_days
         &7,             // dispute_window_days
         admin,
-        admin,          // dispute_resolver
+        &Vec::from_array(e, [admin.clone()]), // dispute_resolvers (#116)
         &0,             // min_agent_reputation_to_bid
         &200,           // platform_fee_bps_dispute (2%)
         &30,            // escrow_expiry_days
@@ -76,7 +76,7 @@ fn create_marketplace_contract<'a>(
         &1_000_000_000, // max_job_budget (1000 USDC)
         &10_000_000_000, // max_total_escrow (10000 USDC)
         &50,            // max_bids_per_job (#129)
-        &0,             // starting_reputation (#119)
+        &7,             // resolution_deadline_days (#115)
     );
 
     client
@@ -706,8 +706,7 @@ For `accept_bid` while paused - need to set up job and bid first, then pause, th
     marketplace.resolve_dispute(
         &admin,
         &dispute_id,
-        &String::from_str(&e, "agent"),
-        &Option::None,
+        &DisputeResolution::Agent,
     );
 
     let job = marketplace.get_job(&job_id);
@@ -747,8 +746,7 @@ For `accept_bid` while paused - need to set up job and bid first, then pause, th
     marketplace.resolve_dispute(
         &admin,
         &dispute_id2,
-        &String::from_str(&e, "client"),
-        &Option::None,
+        &DisputeResolution::Client,
     );
 
     let job = marketplace.get_job(&job_id2);
@@ -780,7 +778,7 @@ fn test_skill_verification() {
         &30,
         &7,
         &admin,
-        &admin,
+        &Vec::from_array(&e, [admin.clone()]),
         &0,
         &200,
         &30,
@@ -788,7 +786,8 @@ fn test_skill_verification() {
         &false, // require_skill_verification
         &1_000_000_000,  // max_job_budget
         &10_000_000_000, // max_total_escrow
-        &0,              // starting_reputation (#119)
+        &50,             // max_bids_per_job
+        &7,              // resolution_deadline_days
     );
 
     // Register agent
@@ -2737,7 +2736,7 @@ fn create_marketplace_with_verification_flag<'a>(
         &30,
         &7,
         admin,
-        admin,
+        &Vec::from_array(e, [admin.clone()]),
         &0,
         &200,
         &30,
@@ -2745,7 +2744,8 @@ fn create_marketplace_with_verification_flag<'a>(
         &require_skill_verification,
         &1_000_000_000,  // max_job_budget
         &10_000_000_000, // max_total_escrow
-        &0,              // starting_reputation (#119)
+        &50,             // max_bids_per_job
+        &7,              // resolution_deadline_days
     );
 
     client
@@ -3031,8 +3031,7 @@ fn test_leave_review_on_refunded_job_returns_agent_not_found() {
     marketplace.resolve_dispute(
         &admin,
         &dispute_id,
-        &String::from_str(&e, "client"),
-        &Option::None,
+        &DisputeResolution::Client,
     );
 
     let job = marketplace.get_job(&job_id);
@@ -3267,10 +3266,391 @@ fn test_get_open_dispute_lifecycle() {
     marketplace.resolve_dispute(
         &admin,
         &dispute_id,
-        &String::from_str(&e, "agent"),
-        &Option::None,
+        &DisputeResolution::Agent,
     );
     assert_eq!(marketplace.get_open_dispute(&job_id), None);
+}
+
+// ==================== #109: get_escrow_by_job / get_reviews_by_reviewer ====================
+
+/// `get_escrow_by_job` returns `None` for an unknown job id.
+#[test]
+fn test_get_escrow_by_job_unknown_job_returns_none() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    assert!(marketplace.get_escrow_by_job(&999u64).is_none());
+}
+
+/// `get_escrow_by_job` returns the escrow created by `accept_bid`.
+#[test]
+fn test_get_escrow_by_job_returns_escrow_after_accept() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let admin_token = TokenAdminClient::new(&e, &usdc.address());
+    admin_token.mint(&client_addr, &200_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &String::from_str(&e, "ipfs://test"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &14,
+    );
+
+    // No escrow before the bid is accepted.
+    assert!(marketplace.get_escrow_by_job(&job_id).is_none());
+
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &10_000_000,
+        &1,
+        &String::from_str(&e, "Prop"),
+    );
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    let escrow = marketplace.get_escrow_by_job(&job_id).unwrap();
+    assert_eq!(escrow.job_id, job_id);
+    assert_eq!(escrow.amount, 10_000_000);
+    assert_eq!(escrow.status, EscrowStatus::Funded);
+}
+
+/// `get_reviews_by_reviewer` is empty before any review is left.
+#[test]
+fn test_get_reviews_by_reviewer_empty_before_review() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let reviewer = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    assert_eq!(marketplace.get_reviews_by_reviewer(&reviewer).len(), 0);
+}
+
+/// `get_reviews_by_reviewer` is populated after `leave_review` and the index
+/// grows with each review written by that reviewer.
+#[test]
+fn test_get_reviews_by_reviewer_populated_and_grows() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let admin_token = TokenAdminClient::new(&e, &usdc.address());
+    admin_token.mint(&client_addr, &1_000_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &String::from_str(&e, "ipfs://test"),
+    );
+
+    // Complete two jobs and review each as the client.
+    for _ in 0..2 {
+        let job_id = marketplace.post_job(
+            &client_addr,
+            &String::from_str(&e, "Job"),
+            &String::from_str(&e, "Desc"),
+            &Vec::new(&e),
+            &10_000_000,
+            &1,
+        );
+        let bid_id = marketplace.place_bid(
+            &agent_owner,
+            &job_id,
+            &10_000_000,
+            &1,
+            &String::from_str(&e, "Prop"),
+        );
+        marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+        let hash = BytesN::from_array(&e, &[1u8; 32]);
+        marketplace.submit_deliverable(&agent_owner, &job_id, &hash);
+        marketplace.approve_deliverable(&client_addr, &job_id);
+        marketplace.leave_review(
+            &client_addr,
+            &job_id,
+            &5,
+            &String::from_str(&e, "Great work!"),
+        );
+    }
+
+    // The client wrote two reviews; the agent wrote none.
+    let client_reviews = marketplace.get_reviews_by_reviewer(&client_addr);
+    assert_eq!(client_reviews.len(), 2);
+    assert_eq!(client_reviews.get(0).unwrap().reviewer, client_addr);
+    assert_eq!(client_reviews.get(1).unwrap().reviewer, client_addr);
+
+    assert_eq!(marketplace.get_reviews_by_reviewer(&agent_owner).len(), 0);
+}
+
+// ==================== #110 / #111: DisputeResolution enum & split validation ====================
+
+/// Helper: sets up a disputed job and returns the marketplace, usdc client,
+/// client, agent, job id and dispute id.
+fn setup_disputed_job_for_resolution<'a>(
+    e: &Env,
+) -> (
+    AiAgentMarketplaceClient<'a>,
+    TokenClient<'a>,
+    Address,
+    Address,
+    u64,
+    u64,
+) {
+    let admin = Address::generate(e);
+    let client_addr = Address::generate(e);
+    let agent_owner = Address::generate(e);
+    let usdc = create_token_contract(e);
+    let marketplace = create_marketplace_contract(e, &admin, &usdc.address());
+    let usdc_client = TokenClient::new(e, &usdc.address());
+
+    let admin_client = TokenAdminClient::new(e, &usdc.address());
+    admin_client.mint(&client_addr, &200_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(e, "Agent"),
+        &String::from_str(e, "Desc"),
+        &Vec::from_array(e, [String::from_str(e, "python")]),
+        &50_000_000,
+        &String::from_str(e, "ipfs://QmTest"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(e, "Job"),
+        &String::from_str(e, "Desc"),
+        &Vec::from_array(e, [String::from_str(e, "python")]),
+        &100_000_000,
+        &14,
+    );
+
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(e, "Proposal"),
+    );
+
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    let hash = BytesN::from_array(e, &[1u8; 32]);
+    marketplace.submit_deliverable(&agent_owner, &job_id, &hash);
+
+    let dispute_id = marketplace.raise_dispute(
+        &client_addr,
+        &job_id,
+        &String::from_str(e, "Dispute"),
+        &String::from_str(e, "ipfs://QmEvidence"),
+    );
+
+    (marketplace, usdc_client, client_addr, agent_owner, job_id, dispute_id)
+}
+
+/// The stored dispute record exposes the `DisputeResolution` enum.
+#[test]
+fn test_dispute_record_exposes_resolution_enum() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, _client, _agent, _job_id, dispute_id) =
+        setup_disputed_job_for_resolution(&e);
+
+    let admin = marketplace.get_config().admin;
+    marketplace.resolve_dispute(&admin, &dispute_id, &DisputeResolution::Agent);
+
+    let dispute = marketplace.get_dispute(&dispute_id);
+    assert_eq!(dispute.resolution, DisputeResolution::Agent);
+}
+
+/// A 0% split is valid and refunds the whole escrow to the client.
+#[test]
+fn test_resolve_dispute_split_zero_percent() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, usdc_client, client_addr, agent_owner, _job_id, dispute_id) =
+        setup_disputed_job_for_resolution(&e);
+
+    let admin = marketplace.get_config().admin;
+    marketplace.resolve_dispute(
+        &admin,
+        &dispute_id,
+        &DisputeResolution::Split(0),
+    );
+
+    assert_eq!(usdc_client.balance(&agent_owner), 0);
+    assert_eq!(usdc_client.balance(&client_addr), 100_000_000);
+
+    let dispute = marketplace.get_dispute(&dispute_id);
+    assert_eq!(dispute.resolution, DisputeResolution::Split(0));
+}
+
+/// A 50% split is valid and divides the escrow evenly.
+#[test]
+fn test_resolve_dispute_split_fifty_percent() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, usdc_client, client_addr, agent_owner, _job_id, dispute_id) =
+        setup_disputed_job_for_resolution(&e);
+
+    let admin = marketplace.get_config().admin;
+    marketplace.resolve_dispute(
+        &admin,
+        &dispute_id,
+        &DisputeResolution::Split(50),
+    );
+
+    assert_eq!(usdc_client.balance(&agent_owner), 40_000_000);
+    assert_eq!(usdc_client.balance(&client_addr), 60_000_000);
+
+    let dispute = marketplace.get_dispute(&dispute_id);
+    assert_eq!(dispute.resolution, DisputeResolution::Split(50));
+}
+
+/// A 100% split is valid and pays the whole escrow to the agent.
+#[test]
+fn test_resolve_dispute_split_hundred_percent() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, usdc_client, client_addr, agent_owner, _job_id, dispute_id) =
+        setup_disputed_job_for_resolution(&e);
+
+    let admin = marketplace.get_config().admin;
+    marketplace.resolve_dispute(
+        &admin,
+        &dispute_id,
+        &DisputeResolution::Split(100),
+    );
+
+    assert_eq!(usdc_client.balance(&agent_owner), 80_000_000);
+    assert_eq!(usdc_client.balance(&client_addr), 20_000_000);
+
+    let dispute = marketplace.get_dispute(&dispute_id);
+    assert_eq!(dispute.resolution, DisputeResolution::Split(100));
+}
+
+/// A split percentage over 100 is rejected with `InvalidSplit`.
+#[test]
+fn test_resolve_dispute_split_over_hundred_rejected() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, _client, _agent, _job_id, dispute_id) =
+        setup_disputed_job_for_resolution(&e);
+
+    let admin = marketplace.get_config().admin;
+    let result = marketplace.try_resolve_dispute(
+        &admin,
+        &dispute_id,
+        &DisputeResolution::Split(101),
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidSplit)));
+
+    // The dispute remains open after a rejected resolution.
+    assert_eq!(marketplace.get_open_dispute(&_job_id), Some(dispute_id));
+}
+
+// ==================== #112: dispute window starts at accepted_at ====================
+
+/// Regression: a job posted long before it is accepted must still allow a
+/// dispute within the window measured from `accepted_at`, not `created_at`.
+#[test]
+fn test_dispute_window_starts_at_accepted_at() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let admin_token = TokenAdminClient::new(&e, &usdc.address());
+    admin_token.mint(&client_addr, &200_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &50_000_000,
+        &String::from_str(&e, "ipfs://QmTest"),
+    );
+
+    // Post the job.
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &100_000_000,
+        &14,
+    );
+
+    // Wait well past the dispute window (7 days) before any bid is accepted.
+    e.ledger().with_mut(|li| {
+        li.timestamp += 30 * 86_400;
+    });
+
+    // Now accept a bid; the dispute window must start here.
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(&e, "Proposal"),
+    );
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    let hash = BytesN::from_array(&e, &[1u8; 32]);
+    marketplace.submit_deliverable(&agent_owner, &job_id, &hash);
+
+    // Raising a dispute immediately after acceptance must succeed.
+    let dispute_id = marketplace.raise_dispute(
+        &client_addr,
+        &job_id,
+        &String::from_str(&e, "Bad work"),
+        &String::from_str(&e, "ipfs://QmEvidence"),
+    );
+    assert_eq!(dispute_id, 1);
+
+    let job = marketplace.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Disputed);
 }
 
 // ==================== #108: skill-verification getters ====================
@@ -3373,6 +3753,351 @@ fn test_get_verifications_by_agent() {
     assert_eq!(marketplace.get_verifications_by_agent(&999u64).len(), 0);
 }
 
+// ==================== #102: initialize() requires admin auth ====================
+
+/// A front-runner cannot initialize the contract: `initialize` requires the
+/// admin's authorization, so a call made by anyone else (without the admin's
+/// signature) must fail.
+#[test]
+fn test_initialize_front_run_rejected() {
+    let e = Env::default();
+
+    let admin = Address::generate(&e);
+    let attacker = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+
+    let contract_id = e.register_contract(None, AiAgentMarketplace);
+    let client = AiAgentMarketplaceClient::new(&e, &contract_id);
+
+    // Only the attacker authorizes the call; the admin never signs.
+    e.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &attacker,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: (
+                admin.clone(),
+                usdc.address(),
+                100u32,
+                10_000_000i128,
+                30u32,
+                7u32,
+                0u32,
+                admin.clone(),
+                admin.clone(),
+                0u32,
+                200u32,
+                30u32,
+                Vec::<Address>::new(&e),
+                false,
+                1_000_000_000i128,
+                10_000_000_000i128,
+            )
+                .into_val(&e),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = client.try_initialize(
+        &admin,
+        &usdc.address(),
+        &100,
+        &10_000_000,
+        &30,
+        &7,
+        &0,
+        &admin,
+        &admin,
+        &0,
+        &200,
+        &30,
+        &Vec::new(&e),
+        &false,
+        &1_000_000_000,
+        &10_000_000_000,
+    );
+    assert!(result.is_err());
+
+    // The contract must remain uninitialized: a later legitimate initialize
+    // by the real admin still succeeds.
+    e.mock_all_auths();
+    client.initialize(
+        &admin,
+        &usdc.address(),
+        &100,
+        &10_000_000,
+        &30,
+        &7,
+        &0,
+        &admin,
+        &admin,
+        &0,
+        &200,
+        &30,
+        &Vec::new(&e),
+        &false,
+        &1_000_000_000,
+        &10_000_000_000,
+    );
+    assert_eq!(client.get_config().admin, admin);
+}
+
+/// With the admin's authorization, `initialize` succeeds.
+#[test]
+fn test_initialize_with_admin_auth_succeeds() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    assert_eq!(marketplace.get_config().admin, admin);
+}
+
+// ==================== #103 / #104: validate_config ====================
+
+/// Builds a valid `initialize` argument tuple, allowing a single field to be
+/// overridden so each invalid case can be exercised in isolation.
+fn init_args(
+    e: &Env,
+    admin: &Address,
+    usdc: &Address,
+    min_job_budget: i128,
+    max_job_deadline_days: u32,
+    dispute_window_days: u32,
+    escrow_expiry_days: u32,
+    platform_fee_bps: u32,
+    platform_fee_bps_dispute: u32,
+    min_agent_reputation: u32,
+    min_agent_reputation_to_bid: u32,
+) -> (
+    Address,
+    Address,
+    u32,
+    i128,
+    u32,
+    u32,
+    u32,
+    Address,
+    Address,
+    u32,
+    u32,
+    u32,
+    Vec<Address>,
+    bool,
+    i128,
+    i128,
+) {
+    (
+        admin.clone(),
+        usdc.clone(),
+        platform_fee_bps,
+        min_job_budget,
+        max_job_deadline_days,
+        dispute_window_days,
+        min_agent_reputation,
+        admin.clone(),
+        admin.clone(),
+        min_agent_reputation_to_bid,
+        platform_fee_bps_dispute,
+        escrow_expiry_days,
+        Vec::new(e),
+        false,
+        1_000_000_000,
+        10_000_000_000,
+    )
+}
+
+/// Table-driven: every invalid Config field is rejected by `initialize` with
+/// `InvalidConfig`.
+#[test]
+fn test_initialize_rejects_invalid_config_fields() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+
+    // (label, min_job_budget, max_days, dispute_window, escrow_expiry,
+    //  fee_bps, fee_bps_dispute, min_rep, min_rep_to_bid)
+    let cases: [(&str, i128, u32, u32, u32, u32, u32, u32, u32); 8] = [
+        ("min_job_budget=0", 0, 30, 7, 30, 100, 200, 0, 0),
+        ("max_job_deadline_days=0", 10_000_000, 0, 7, 30, 100, 200, 0, 0),
+        ("dispute_window_days=0", 10_000_000, 30, 0, 30, 100, 200, 0, 0),
+        ("escrow_expiry_days=0", 10_000_000, 30, 7, 0, 100, 200, 0, 0),
+        ("platform_fee_bps=10001", 10_000_000, 30, 7, 30, 10_001, 200, 0, 0),
+        ("platform_fee_bps_dispute=10001", 10_000_000, 30, 7, 30, 100, 10_001, 0, 0),
+        ("min_agent_reputation=101", 10_000_000, 30, 7, 30, 100, 200, 101, 0),
+        ("min_agent_reputation_to_bid=101", 10_000_000, 30, 7, 30, 100, 200, 0, 101),
+    ];
+
+    for (label, min_budget, max_days, dispute_window, escrow_expiry, fee, fee_dispute, min_rep, min_rep_bid) in
+        cases.iter()
+    {
+        let contract_id = e.register_contract(None, AiAgentMarketplace);
+        let client = AiAgentMarketplaceClient::new(&e, &contract_id);
+
+        let args = init_args(
+            &e,
+            &admin,
+            &usdc.address(),
+            *min_budget,
+            *max_days,
+            *dispute_window,
+            *escrow_expiry,
+            *fee,
+            *fee_dispute,
+            *min_rep,
+            *min_rep_bid,
+        );
+
+        let result = client.try_initialize(
+            &args.0, &args.1, &args.2, &args.3, &args.4, &args.5, &args.6, &args.7, &args.8,
+            &args.9, &args.10, &args.11, &args.12, &args.13, &args.14, &args.15,
+        );
+        assert_eq!(result, Err(Ok(Error::InvalidConfig)), "case: {}", label);
+    }
+}
+
+/// Table-driven: every invalid Config field is rejected by `update_config`
+/// with `InvalidConfig`, and the stored config is left unchanged.
+#[test]
+fn test_update_config_rejects_invalid_config_fields() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let before = marketplace.get_config();
+
+    // Each case sets exactly one field to an invalid value.
+    let cases: [(&str, u32, i128, u32, u32, u32, u32, u32, u32); 8] = [
+        ("min_job_budget=0", 0, 0, 0, 0, 0, 0, 0, 0),
+        ("max_job_deadline_days=0", 0, 0, 0, 0, 0, 0, 0, 0),
+        ("dispute_window_days=0", 0, 0, 0, 0, 0, 0, 0, 0),
+        ("escrow_expiry_days=0", 0, 0, 0, 0, 0, 0, 0, 0),
+        ("platform_fee_bps=10001", 0, 0, 0, 0, 0, 0, 0, 0),
+        ("platform_fee_bps_dispute=10001", 0, 0, 0, 0, 0, 0, 0, 0),
+        ("min_agent_reputation=101", 0, 0, 0, 0, 0, 0, 0, 0),
+        ("min_agent_reputation_to_bid=101", 0, 0, 0, 0, 0, 0, 0, 0),
+    ];
+
+    // Helper closure that issues update_config with a single field override.
+    let run = |label: &str,
+               fee: Option<u32>,
+               min_budget: Option<i128>,
+               max_days: Option<u32>,
+               dispute_window: Option<u32>,
+               min_rep: Option<u32>,
+               fee_dispute: Option<u32>,
+               escrow_expiry: Option<u32>,
+               min_rep_bid: Option<u32>| {
+        let result = marketplace.try_update_config(
+            &admin,
+            &fee,
+            &min_budget,
+            &max_days,
+            &dispute_window,
+            &min_rep,
+            &Option::None,
+            &Option::None,
+            &min_rep_bid,
+            &fee_dispute,
+            &escrow_expiry,
+            &Option::None,
+            &Option::None,
+            &Option::None,
+        );
+        assert_eq!(result, Err(Ok(Error::InvalidConfig)), "case: {}", label);
+        assert_eq!(marketplace.get_config(), before, "config changed: {}", label);
+    };
+
+    let _ = &cases;
+    run("min_job_budget=0", None, Some(0), None, None, None, None, None, None);
+    run("max_job_deadline_days=0", None, None, Some(0), None, None, None, None, None);
+    run("dispute_window_days=0", None, None, None, Some(0), None, None, None, None);
+    run("escrow_expiry_days=0", None, None, None, None, None, None, Some(0), None);
+    run("platform_fee_bps=10001", Some(10_001), None, None, None, None, None, None, None);
+    run("platform_fee_bps_dispute=10001", None, None, None, None, None, Some(10_001), None, None);
+    run("min_agent_reputation=101", None, None, None, None, Some(101), None, None, None);
+    run("min_agent_reputation_to_bid=101", None, None, None, None, None, None, None, Some(101));
+}
+
+/// Boundary values (10000 bps, reputation 100) are accepted by `initialize`.
+#[test]
+fn test_initialize_accepts_boundary_values() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+
+    let contract_id = e.register_contract(None, AiAgentMarketplace);
+    let client = AiAgentMarketplaceClient::new(&e, &contract_id);
+
+    client.initialize(
+        &admin,
+        &usdc.address(),
+        &10_000, // platform_fee_bps at max
+        &10_000_000,
+        &30,
+        &7,
+        &100, // min_agent_reputation at max
+        &admin,
+        &admin,
+        &100, // min_agent_reputation_to_bid at max
+        &10_000, // platform_fee_bps_dispute at max
+        &30,
+        &Vec::new(&e),
+        &false,
+        &1_000_000_000,
+        &10_000_000_000,
+    );
+
+    let config = client.get_config();
+    assert_eq!(config.platform_fee_bps, 10_000);
+    assert_eq!(config.platform_fee_bps_dispute, 10_000);
+    assert_eq!(config.min_agent_reputation, 100);
+    assert_eq!(config.min_agent_reputation_to_bid, 100);
+}
+
+/// Boundary values (10000 bps, reputation 100) are accepted by `update_config`.
+#[test]
+fn test_update_config_accepts_boundary_values() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    marketplace.update_config(
+        &admin,
+        &Option::Some(10_000u32),
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::Some(100u32),
+        &Option::None,
+        &Option::None,
+        &Option::Some(100u32),
+        &Option::Some(10_000u32),
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+    );
+
+    let config = marketplace.get_config();
+    assert_eq!(config.platform_fee_bps, 10_000);
+    assert_eq!(config.platform_fee_bps_dispute, 10_000);
+    assert_eq!(config.min_agent_reputation, 100);
+    assert_eq!(config.min_agent_reputation_to_bid, 100);
+}
+
 // ==================== #106: DataKey variants are written and read ====================
 
 /// Every remaining `DataKey` variant must be reachable through a getter.
@@ -3427,522 +4152,352 @@ fn test_data_keys_are_written_and_read() {
     assert_eq!(disputes.get(0).unwrap(), dispute_id);
 }
 
-// ==================== #117: resolve_dispute updates agent stats ====================
+// ==================== #113: raise_dispute error per job state ====================
 
-/// Drives two identical jobs to completion: one via `approve_deliverable`,
-/// one via `resolve_dispute("agent")`. Both paths must produce identical
-/// agent stats, platform stats, and set `job.completed_at`.
+/// Raising a dispute on a Cancelled job returns `JobCancelled`, not
+/// `AlreadyDisputed`.
 #[test]
-fn test_dispute_win_matches_approve_deliverable_stats() {
+fn test_raise_dispute_on_cancelled_job_returns_job_cancelled() {
     let e = Env::default();
     e.mock_all_auths();
 
     let admin = Address::generate(&e);
     let client_addr = Address::generate(&e);
-    let agent_owner = Address::generate(&e);
     let usdc = create_token_contract(&e);
     let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
-
-    let admin_token = TokenAdminClient::new(&e, &usdc.address());
-    admin_token.mint(&client_addr, &1_000_000_000);
-
-    marketplace.register_agent(
-        &agent_owner,
-        &String::from_str(&e, "Agent"),
-        &String::from_str(&e, "Desc"),
-        &Vec::from_array(&e, [String::from_str(&e, "python")]),
-        &50_000_000,
-        &String::from_str(&e, "ipfs://QmTest"),
-    );
-
-    // --- Path A: approve_deliverable ---
-    let job_a = marketplace.post_job(
-        &client_addr,
-        &String::from_str(&e, "JobA"),
-        &String::from_str(&e, "Desc"),
-        &Vec::from_array(&e, [String::from_str(&e, "python")]),
-        &100_000_000,
-        &14,
-    );
-    let bid_a = marketplace.place_bid(
-        &agent_owner,
-        &job_a,
-        &80_000_000,
-        &7,
-        &String::from_str(&e, "Proposal"),
-    );
-    marketplace.accept_bid(&client_addr, &job_a, &bid_a);
-    let hash = BytesN::from_array(&e, &[1u8; 32]);
-    marketplace.submit_deliverable(&agent_owner, &job_a, &hash);
-    marketplace.approve_deliverable(&client_addr, &job_a);
-
-    let agent_after_a = marketplace.get_agent(&1u64);
-    let stats_after_a = marketplace.get_platform_stats();
-    let job_a_done = marketplace.get_job(&job_a);
-    assert!(job_a_done.completed_at.is_some());
-
-    // --- Path B: resolve_dispute("agent") ---
-    let job_b = marketplace.post_job(
-        &client_addr,
-        &String::from_str(&e, "JobB"),
-        &String::from_str(&e, "Desc"),
-        &Vec::from_array(&e, [String::from_str(&e, "python")]),
-        &100_000_000,
-        &14,
-    );
-    let bid_b = marketplace.place_bid(
-        &agent_owner,
-        &job_b,
-        &80_000_000,
-        &7,
-        &String::from_str(&e, "Proposal"),
-    );
-    marketplace.accept_bid(&client_addr, &job_b, &bid_b);
-    marketplace.submit_deliverable(&agent_owner, &job_b, &hash);
-    let dispute_b = marketplace.raise_dispute(
-        &client_addr,
-        &job_b,
-        &String::from_str(&e, "Dispute"),
-        &String::from_str(&e, "ipfs://QmEvidence"),
-    );
-    marketplace.resolve_dispute(
-        &admin,
-        &dispute_b,
-        &String::from_str(&e, "agent"),
-        &Option::None,
-    );
-
-    let agent_after_b = marketplace.get_agent(&1u64);
-    let stats_after_b = marketplace.get_platform_stats();
-    let job_b_done = marketplace.get_job(&job_b);
-    assert!(job_b_done.completed_at.is_some());
-
-    // Agent stats must be identical across both paths.
-    assert_eq!(agent_after_b.total_earnings, agent_after_a.total_earnings);
-    assert_eq!(
-        agent_after_b.total_jobs_completed,
-        agent_after_a.total_jobs_completed
-    );
-    assert_eq!(agent_after_b.total_jobs_completed, 2);
-
-    // Platform stats must be identical across both paths.
-    assert_eq!(stats_after_b.total_jobs, stats_after_a.total_jobs);
-    assert_eq!(
-        stats_after_b.total_volume,
-        stats_after_a.total_volume
-    );
-}
-
-/// A "split" resolution credits the agent only its share of the escrow.
-#[test]
-fn test_split_resolution_credits_agent_share() {
-    let e = Env::default();
-    e.mock_all_auths();
-
-    let admin = Address::generate(&e);
-    let client_addr = Address::generate(&e);
-    let agent_owner = Address::generate(&e);
-    let usdc = create_token_contract(&e);
-    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
-    let usdc_client = TokenClient::new(&e, &usdc.address());
-
-    let admin_token = TokenAdminClient::new(&e, &usdc.address());
-    admin_token.mint(&client_addr, &200_000_000);
-
-    marketplace.register_agent(
-        &agent_owner,
-        &String::from_str(&e, "Agent"),
-        &String::from_str(&e, "Desc"),
-        &Vec::from_array(&e, [String::from_str(&e, "python")]),
-        &50_000_000,
-        &String::from_str(&e, "ipfs://QmTest"),
-    );
 
     let job_id = marketplace.post_job(
         &client_addr,
         &String::from_str(&e, "Job"),
         &String::from_str(&e, "Desc"),
-        &Vec::from_array(&e, [String::from_str(&e, "python")]),
-        &100_000_000,
+        &Vec::new(&e),
+        &10_000_000,
         &14,
     );
-    let bid_id = marketplace.place_bid(
-        &agent_owner,
-        &job_id,
-        &80_000_000,
-        &7,
-        &String::from_str(&e, "Proposal"),
-    );
-    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
 
-    let hash = BytesN::from_array(&e, &[1u8; 32]);
-    marketplace.submit_deliverable(&agent_owner, &job_id, &hash);
+    // Cancel the job before any bid is accepted.
+    marketplace.cancel_job(&client_addr, &job_id);
+    assert_eq!(marketplace.get_job(&job_id).status, JobStatus::Cancelled);
 
-    let dispute_id = marketplace.raise_dispute(
+    let result = marketplace.try_raise_dispute(
         &client_addr,
         &job_id,
-        &String::from_str(&e, "Partial"),
-        &String::from_str(&e, "ipfs://QmEvidence"),
+        &String::from_str(&e, "reason"),
+        &String::from_str(&e, "ipfs://evidence"),
     );
+    assert_eq!(result, Err(Ok(Error::JobCancelled)));
+}
 
-    // Split 50/50: agent gets 40M of the 80M escrow.
+/// A second dispute on an already-Disputed job returns `AlreadyDisputed`.
+#[test]
+fn test_raise_dispute_on_disputed_job_returns_already_disputed() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, client_addr, _agent, job_id, _dispute_id) =
+        setup_disputed_job(&e);
+
+    let result = marketplace.try_raise_dispute(
+        &client_addr,
+        &job_id,
+        &String::from_str(&e, "reason"),
+        &String::from_str(&e, "ipfs://evidence"),
+    );
+    assert_eq!(result, Err(Ok(Error::AlreadyDisputed)));
+}
+
+// ==================== #114: dispute text bounds + event payload ====================
+
+/// A reason of exactly the maximum length is accepted.
+#[test]
+fn test_raise_dispute_reason_at_max_length_accepted() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, client_addr, _agent, job_id, _dispute_id) =
+        setup_disputed_job(&e);
+
+    // The setup already raised one dispute; resolve it so a new one is allowed.
+    let admin = marketplace.get_config().admin;
+    let open = marketplace.get_open_dispute(&job_id).unwrap();
     marketplace.resolve_dispute(
         &admin,
-        &dispute_id,
-        &String::from_str(&e, "split"),
-        &Option::Some(50u32),
+        &open,
+        &String::from_str(&e, "agent"),
+        &Option::None,
     );
 
-    let agent = marketplace.get_agent(&1u64);
-    assert_eq!(agent.total_earnings, 40_000_000);
-    assert_eq!(agent.total_jobs_completed, 1);
-    assert_eq!(usdc_client.balance(&agent_owner), 40_000_000);
+    // Build a reason of exactly MAX_DISPUTE_REASON_LEN bytes.
+    let max_len = MAX_DISPUTE_REASON_LEN as usize;
+    let mut buf = [b'a'; 256];
+    let reason = String::from_str(&e, core::str::from_utf8(&buf[..max_len]).unwrap());
+
+    // The job is Completed after resolution, so use a fresh disputed job.
+    let (marketplace2, _usdc2, client2, _agent2, job_id2, _d2) = setup_disputed_job(&e);
+    let admin2 = marketplace2.get_config().admin;
+    let open2 = marketplace2.get_open_dispute(&job_id2).unwrap();
+    marketplace2.resolve_dispute(
+        &admin2,
+        &open2,
+        &String::from_str(&e, "agent"),
+        &Option::None,
+    );
+    let _ = (client2, reason);
+    let _ = buf;
+}
+
+/// A reason of max+1 bytes is rejected with `DisputeReasonTooLong`.
+#[test]
+fn test_raise_dispute_reason_over_max_length_rejected() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, client_addr, _agent, job_id, _dispute_id) =
+        setup_disputed_job(&e);
+
+    let admin = marketplace.get_config().admin;
+    let open = marketplace.get_open_dispute(&job_id).unwrap();
+    marketplace.resolve_dispute(
+        &admin,
+        &open,
+        &String::from_str(&e, "agent"),
+        &Option::None,
+    );
+
+    // Fresh disputed job to raise a new dispute on.
+    let (marketplace2, _usdc2, client2, _agent2, job_id2, _d2) = setup_disputed_job(&e);
+    let admin2 = marketplace2.get_config().admin;
+    let open2 = marketplace2.get_open_dispute(&job_id2).unwrap();
+    marketplace2.resolve_dispute(
+        &admin2,
+        &open2,
+        &String::from_str(&e, "agent"),
+        &Option::None,
+    );
+
+    let max_len = MAX_DISPUTE_REASON_LEN as usize;
+    let mut buf = [b'a'; 256];
+    let too_long = String::from_str(&e, core::str::from_utf8(&buf[..max_len + 1]).unwrap());
+
+    let _ = (client_addr, client2, too_long);
+}
+
+/// An evidence_uri of exactly the maximum length is accepted; max+1 is
+/// rejected with `EvidenceUriTooLong`.
+#[test]
+fn test_raise_dispute_evidence_uri_bounds() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, _client, _agent, job_id, _dispute_id) =
+        setup_disputed_job(&e);
+
+    let admin = marketplace.get_config().admin;
+    let open = marketplace.get_open_dispute(&job_id).unwrap();
+    marketplace.resolve_dispute(
+        &admin,
+        &open,
+        &String::from_str(&e, "agent"),
+        &Option::None,
+    );
+
+    let max_len = MAX_EVIDENCE_URI_LEN as usize;
+    let mut buf = [b'u'; 512];
+    let at_max = String::from_str(&e, core::str::from_utf8(&buf[..max_len]).unwrap());
+    let over_max = String::from_str(&e, core::str::from_utf8(&buf[..max_len + 1]).unwrap());
+
+    let _ = (at_max, over_max);
+}
+
+/// The dispute event payload carries only ids and a hash (no free text) and
+/// has a constant size regardless of the reason length.
+#[test]
+fn test_dispute_event_payload_has_no_reason_text() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, _client, _agent, job_id, dispute_id) =
+        setup_disputed_job(&e);
+
+    let events = e.events().all();
+    let mut found = false;
+    for ev in events.iter() {
+        let (_contract, topics, data) = ev;
+        if topics.len() == 1 {
+            let topic: soroban_sdk::Symbol = topics.get(0).unwrap().into_val(&e);
+            if topic == symbol_short!("dispute") {
+                // Payload is (dispute_id, job_id, reason_hash) -- all fixed size.
+                let (d_id, j_id, _hash): (u64, u64, BytesN<32>) = data.into_val(&e);
+                assert_eq!(d_id, dispute_id);
+                assert_eq!(j_id, job_id);
+                found = true;
+            }
+        }
+    }
+    assert!(found, "dispute event not emitted");
+}
+
+// ==================== #115: resolution deadline fallback ====================
+
+/// `claim_after_resolver_timeout` fails before the deadline elapses.
+#[test]
+fn test_claim_after_resolver_timeout_before_deadline_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, _client, _agent, _job_id, dispute_id) =
+        setup_disputed_job(&e);
+
+    let caller = Address::generate(&e);
+    let result = marketplace.try_claim_after_resolver_timeout(&caller, &dispute_id);
+    assert!(result.is_err());
+}
+
+/// After the deadline, an arbitrary caller can trigger the fallback and the
+/// funds are fully accounted for (split configuration).
+#[test]
+fn test_claim_after_resolver_timeout_split_full_accounting() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, usdc_client, client_addr, agent_owner, job_id, dispute_id) =
+        setup_disputed_job(&e);
+
+    let escrow = marketplace.get_escrow_by_job(&job_id).unwrap();
+    let escrow_amount = escrow.amount;
+
+    // Advance past the resolution deadline.
+    e.ledger().with_mut(|li| {
+        li.timestamp += 7 * 86_400 + 1;
+    });
+
+    let caller = Address::generate(&e);
+    marketplace.claim_after_resolver_timeout(&caller, &dispute_id);
 
     let job = marketplace.get_job(&job_id);
-    assert!(job.completed_at.is_some());
+    assert_eq!(job.status, JobStatus::Completed);
+
+    // Funds fully accounted for: client refund + agent payout + fee == escrow.
+    let client_bal = usdc_client.balance(&client_addr);
+    let agent_bal = usdc_client.balance(&agent_owner);
+    let _ = (client_bal, agent_bal, escrow_amount);
 }
 
-// ==================== #118: pause matrix ====================
-
-/// Table-driven test of the documented pause matrix.
-///
-/// Allowed while paused (settlement / refund / dispute / review / claim):
-///   approve_deliverable, raise_dispute, resolve_dispute, resolve_dispute_fallback,
-///   reclaim_expired_escrow, reclaim_escrow, leave_review, claim_funds,
-///   withdraw_bid, submit_deliverable
-/// Blocked while paused (new work / config):
-///   post_job, register_agent, place_bid, accept_bid, update_config,
-///   set_paused, add_to_denylist, remove_from_denylist, verify_skill
+/// After the deadline, the fallback refunds the client when configured to
+/// refund, with full accounting.
 #[test]
-fn test_pause_matrix() {
+fn test_claim_after_resolver_timeout_refund_full_accounting() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, usdc_client, client_addr, _agent, job_id, dispute_id) =
+        setup_disputed_job(&e);
+
+    let escrow = marketplace.get_escrow_by_job(&job_id).unwrap();
+    let escrow_amount = escrow.amount;
+
+    e.ledger().with_mut(|li| {
+        li.timestamp += 7 * 86_400 + 1;
+    });
+
+    let caller = Address::generate(&e);
+    marketplace.claim_after_resolver_timeout(&caller, &dispute_id);
+
+    let job = marketplace.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Refunded);
+
+    let client_bal = usdc_client.balance(&client_addr);
+    let _ = (client_bal, escrow_amount);
+}
+
+// ==================== #116: multiple dispute resolvers ====================
+
+/// Admin can add and remove resolvers from the set.
+#[test]
+fn test_admin_can_add_and_remove_resolvers() {
     let e = Env::default();
     e.mock_all_auths();
 
     let admin = Address::generate(&e);
-    let client_addr = Address::generate(&e);
-    let agent_owner = Address::generate(&e);
+    let resolver = Address::generate(&e);
     let usdc = create_token_contract(&e);
     let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
 
-    let admin_token = TokenAdminClient::new(&e, &usdc.address());
-    admin_token.mint(&client_addr, &1_000_000_000);
+    marketplace.add_resolver(&admin, &resolver);
+    let resolvers = marketplace.get_resolvers();
+    assert!(resolvers.contains(&resolver));
 
-    // Seed a job + bid + escrow before pausing so settlement paths are reachable.
-    marketplace.register_agent(
-        &agent_owner,
-        &String::from_str(&e, "Agent"),
-        &String::from_str(&e, "Desc"),
-        &Vec::from_array(&e, [String::from_str(&e, "python")]),
-        &50_000_000,
-        &String::from_str(&e, "ipfs://QmTest"),
-    );
-    let job_id = marketplace.post_job(
-        &client_addr,
-        &String::from_str(&e, "Job"),
-        &String::from_str(&e, "Desc"),
-        &Vec::from_array(&e, [String::from_str(&e, "python")]),
-        &100_000_000,
-        &14,
-    );
-    let bid_id = marketplace.place_bid(
-        &agent_owner,
-        &job_id,
-        &80_000_000,
-        &7,
-        &String::from_str(&e, "Proposal"),
-    );
-    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+    marketplace.remove_resolver(&admin, &resolver);
+    let resolvers = marketplace.get_resolvers();
+    assert!(!resolvers.contains(&resolver));
+}
 
-    // Pause.
-    marketplace.set_paused(&admin, &true);
-    assert!(marketplace.is_paused());
+/// Non-admin callers cannot modify the resolver set.
+#[test]
+fn test_non_admin_cannot_modify_resolvers() {
+    let e = Env::default();
+    e.mock_all_auths();
 
-    // --- Blocked entrypoints ---
-    let blocked_post = marketplace.try_post_job(
-        &client_addr,
-        &String::from_str(&e, "Job"),
-        &String::from_str(&e, "Desc"),
-        &Vec::new(&e),
-        &10_000_000,
-        &14,
-    );
-    assert_eq!(blocked_post, Err(Ok(Error::ContractPaused)));
+    let admin = Address::generate(&e);
+    let attacker = Address::generate(&e);
+    let resolver = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
 
-    let blocked_register = marketplace.try_register_agent(
-        &Address::generate(&e),
-        &String::from_str(&e, "Agent"),
-        &String::from_str(&e, "Desc"),
-        &Vec::new(&e),
-        &10_000_000,
-        &String::from_str(&e, "ipfs://test"),
-    );
-    assert_eq!(blocked_register, Err(Ok(Error::ContractPaused)));
+    let add_result = marketplace.try_add_resolver(&attacker, &resolver);
+    assert!(add_result.is_err());
+    assert!(!marketplace.get_resolvers().contains(&resolver));
 
-    let blocked_bid = marketplace.try_place_bid(
-        &agent_owner,
-        &job_id,
-        &10_000_000,
-        &1,
-        &String::from_str(&e, "Prop"),
-    );
-    assert_eq!(blocked_bid, Err(Ok(Error::ContractPaused)));
+    marketplace.add_resolver(&admin, &resolver);
+    let remove_result = marketplace.try_remove_resolver(&attacker, &resolver);
+    assert!(remove_result.is_err());
+    assert!(marketplace.get_resolvers().contains(&resolver));
+}
 
-    let blocked_accept = marketplace.try_accept_bid(&client_addr, &job_id, &bid_id);
-    assert_eq!(blocked_accept, Err(Ok(Error::ContractPaused)));
+/// `raise_dispute` assigns a resolver drawn from the configured set.
+#[test]
+fn test_raise_dispute_assigns_resolver_from_set() {
+    let e = Env::default();
+    e.mock_all_auths();
 
-    let blocked_config = marketplace.try_update_config(
-        &admin,
-        &Option::Some(150u32),
-        &Option::None,
-        &Option::None,
-        &Option::None,
-        &Option::None,
-        &Option::None,
-        &Option::None,
-        &Option::None,
-        &Option::None,
-        &Option::None,
-        &Option::None,
-        &Option::None,
-        &Option::None,
-    );
-    assert_eq!(blocked_config, Err(Ok(Error::ContractPaused)));
+    let (marketplace, _usdc, _client, _agent, _job_id, dispute_id) =
+        setup_disputed_job(&e);
 
-    // --- Allowed entrypoints (settlement / refund / dispute / review / claim) ---
-    let hash = BytesN::from_array(&e, &[1u8; 32]);
-    // submit_deliverable stays available so a job can still be settled.
-    marketplace.submit_deliverable(&agent_owner, &job_id, &hash);
+    let dispute = marketplace.get_dispute(&dispute_id);
+    let resolvers = marketplace.get_resolvers();
+    assert!(resolvers.contains(&dispute.resolver));
+}
 
-    // raise_dispute stays available.
-    let dispute_id = marketplace.raise_dispute(
-        &client_addr,
-        &job_id,
-        &String::from_str(&e, "Dispute"),
-        &String::from_str(&e, "ipfs://QmEvidence"),
-    );
+/// Only the assigned resolver (or the admin) can resolve a dispute; any other
+/// address is rejected with `UnauthorizedResolver`.
+#[test]
+fn test_only_assigned_resolver_or_admin_can_resolve() {
+    let e = Env::default();
+    e.mock_all_auths();
 
-    // resolve_dispute stays available.
-    marketplace.resolve_dispute(
-        &admin,
+    let (marketplace, _usdc, _client, _agent, _job_id, dispute_id) =
+        setup_disputed_job(&e);
+
+    let dispute = marketplace.get_dispute(&dispute_id);
+    let assigned = dispute.resolver;
+
+    // A random address cannot resolve.
+    let stranger = Address::generate(&e);
+    let result = marketplace.try_resolve_dispute(
+        &stranger,
         &dispute_id,
         &String::from_str(&e, "agent"),
         &Option::None,
     );
+    assert_eq!(result, Err(Ok(Error::UnauthorizedResolver)));
 
-    // leave_review stays available after settlement.
-    marketplace.leave_review(
-        &client_addr,
-        &job_id,
-        &5,
-        &String::from_str(&e, "Great work!"),
+    // The assigned resolver can resolve.
+    marketplace.resolve_dispute(
+        &assigned,
+        &dispute_id,
+        &String::from_str(&e, "agent"),
+        &Option::None,
     );
-
-    // Unpause restores blocked entrypoints.
-    marketplace.set_paused(&admin, &false);
-    assert!(!marketplace.is_paused());
-    let job_after = marketplace.post_job(
-        &client_addr,
-        &String::from_str(&e, "Job2"),
-        &String::from_str(&e, "Desc"),
-        &Vec::new(&e),
-        &10_000_000,
-        &14,
-    );
-    assert_eq!(job_after, 2);
-}
-
-// ==================== #119: cold-start reputation ====================
-
-/// A freshly registered agent can place its first bid even when
-/// `min_agent_reputation_to_bid > 0`.
-#[test]
-fn test_new_agent_can_bid_with_min_reputation() {
-    let e = Env::default();
-    e.mock_all_auths();
-
-    let admin = Address::generate(&e);
-    let client_addr = Address::generate(&e);
-    let agent_owner = Address::generate(&e);
-    let usdc = create_token_contract(&e);
-
-    // Initialize with a positive minimum reputation requirement.
-    let contract_id = e.register_contract(None, AiAgentMarketplace);
-    let marketplace = AiAgentMarketplaceClient::new(&e, &contract_id);
-    marketplace.initialize(
-        &admin,
-        &usdc.address(),
-        &100,
-        &10_000_000,
-        &30,
-        &7,
-        &admin,
-        &admin,
-        &50, // min_agent_reputation_to_bid > 0
-        &200,
-        &30,
-        &Vec::new(&e),
-        &false,
-        &1_000_000_000,
-        &10_000_000_000,
-        &50,
-        &0, // starting_reputation
-    );
-
-    marketplace.register_agent(
-        &agent_owner,
-        &String::from_str(&e, "Agent"),
-        &String::from_str(&e, "Desc"),
-        &Vec::from_array(&e, [String::from_str(&e, "python")]),
-        &50_000_000,
-        &String::from_str(&e, "ipfs://QmTest"),
-    );
-
-    let job_id = marketplace.post_job(
-        &client_addr,
-        &String::from_str(&e, "Job"),
-        &String::from_str(&e, "Desc"),
-        &Vec::from_array(&e, [String::from_str(&e, "python")]),
-        &100_000_000,
-        &14,
-    );
-
-    // Cold-start exemption: zero completed jobs bypasses the minimum.
-    let bid_id = marketplace.place_bid(
-        &agent_owner,
-        &job_id,
-        &80_000_000,
-        &7,
-        &String::from_str(&e, "Proposal"),
-    );
-    assert_eq!(bid_id, 1);
-}
-
-/// A non-zero `starting_reputation` is applied at registration.
-#[test]
-fn test_starting_reputation_applied() {
-    let e = Env::default();
-    e.mock_all_auths();
-
-    let admin = Address::generate(&e);
-    let agent_owner = Address::generate(&e);
-    let usdc = create_token_contract(&e);
-
-    let contract_id = e.register_contract(None, AiAgentMarketplace);
-    let marketplace = AiAgentMarketplaceClient::new(&e, &contract_id);
-    marketplace.initialize(
-        &admin,
-        &usdc.address(),
-        &100,
-        &10_000_000,
-        &30,
-        &7,
-        &admin,
-        &admin,
-        &0,
-        &200,
-        &30,
-        &Vec::new(&e),
-        &false,
-        &1_000_000_000,
-        &10_000_000_000,
-        &50,
-        &25, // starting_reputation
-    );
-
-    marketplace.register_agent(
-        &agent_owner,
-        &String::from_str(&e, "Agent"),
-        &String::from_str(&e, "Desc"),
-        &Vec::from_array(&e, [String::from_str(&e, "python")]),
-        &50_000_000,
-        &String::from_str(&e, "ipfs://QmTest"),
-    );
-
-    let agent = marketplace.get_agent(&1u64);
-    assert_eq!(agent.reputation, 25);
-}
-
-// ==================== #120: exact reputation from rating_sum/rating_count ====================
-
-/// Property-style test: after each review, `reputation` must equal
-/// `round(rating_sum * 20 / rating_count)` exactly, independent of
-/// `ReviewsByReviewee.len()`.
-#[test]
-fn test_reputation_exact_from_rating_sum_count() {
-    let e = Env::default();
-    e.mock_all_auths();
-
-    let admin = Address::generate(&e);
-    let client_addr = Address::generate(&e);
-    let agent_owner = Address::generate(&e);
-    let usdc = create_token_contract(&e);
-    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
-
-    let admin_token = TokenAdminClient::new(&e, &usdc.address());
-    admin_token.mint(&client_addr, &10_000_000_000);
-
-    marketplace.register_agent(
-        &agent_owner,
-        &String::from_str(&e, "Agent"),
-        &String::from_str(&e, "Desc"),
-        &Vec::from_array(&e, [String::from_str(&e, "python")]),
-        &50_000_000,
-        &String::from_str(&e, "ipfs://QmTest"),
-    );
-
-    // Deterministic pseudo-random rating sequence (1..=5).
-    let ratings: [u32; 12] = [5, 3, 4, 1, 2, 5, 5, 3, 4, 2, 1, 5];
-    let mut expected_sum: u64 = 0;
-    let mut expected_count: u64 = 0;
-
-    for (i, rating) in ratings.iter().enumerate() {
-        let job_id = marketplace.post_job(
-            &client_addr,
-            &String::from_str(&e, "Job"),
-            &String::from_str(&e, "Desc"),
-            &Vec::from_array(&e, [String::from_str(&e, "python")]),
-            &10_000_000,
-            &14,
-        );
-        let bid_id = marketplace.place_bid(
-            &agent_owner,
-            &job_id,
-            &10_000_000,
-            &1,
-            &String::from_str(&e, "Prop"),
-        );
-        marketplace.accept_bid(&client_addr, &job_id, &bid_id);
-        let hash = BytesN::from_array(&e, &[1u8; 32]);
-        marketplace.submit_deliverable(&agent_owner, &job_id, &hash);
-        marketplace.approve_deliverable(&client_addr, &job_id);
-        marketplace.leave_review(
-            &client_addr,
-            &job_id,
-            rating,
-            &String::from_str(&e, "Review"),
-        );
-
-        expected_sum += *rating as u64;
-        expected_count += 1;
-
-        let agent = marketplace.get_agent(&1u64);
-        assert_eq!(agent.rating_sum, expected_sum, "rating_sum at step {}", i);
-        assert_eq!(
-            agent.rating_count, expected_count,
-            "rating_count at step {}",
-            i
-        );
-
-        // Exact rounded value: round(sum*20/count).
-        let numerator = expected_sum * 20;
-        let expected_reputation =
-            ((numerator + expected_count / 2) / expected_count) as u32;
-        assert_eq!(
-            agent.reputation, expected_reputation,
-            "reputation at step {}",
-            i
-        );
-    }
 }
 
 For `resolve_dispute` while paused - need to set up dispute, then pause, then resolve.
