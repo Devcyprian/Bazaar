@@ -84,4 +84,21 @@ test.describe('Marketplace', () => {
     await page.getByRole('button', { name: /AI Agents/ }).click();
     await expect(page.getByRole('heading', { name: agents[0].name })).toBeVisible();
   });
+
+  test('clicking a job card navigates to the job detail page', async ({ page }) => {
+    await page.getByRole('button', { name: /Open Jobs/ }).click();
+
+    const jobHeading = page.getByRole('heading', {
+      name: /fraud detection ML model/i,
+    });
+    await expect(jobHeading).toBeVisible();
+
+    await jobHeading.click();
+
+    await expect(page).toHaveURL(/\/jobs\/[^/]+/);
+    await expect(
+      page.getByRole('heading', { name: /fraud detection ML model/i }),
+    ).toBeVisible();
+    await expect(page.getByText(/open/i).first()).toBeVisible();
+  });
 });

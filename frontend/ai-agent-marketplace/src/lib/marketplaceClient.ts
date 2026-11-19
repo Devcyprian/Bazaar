@@ -543,6 +543,26 @@ export class MarketplaceClient {
     unwrapResult(raw);
   }
 
+  /**
+   * Leave a review for the counterparty of a completed job.
+   * `rating` must be 1-5; `comment` is free-form text.
+   * Returns the new review id.
+   */
+  async leaveReview(
+    publicKey: string,
+    signTransaction: SignFn,
+    params: { jobId: number; rating: number; comment: string },
+  ): Promise<number> {
+    const raw = await this.send(
+      'leave_review', publicKey, signTransaction,
+      addr(publicKey),
+      u64(params.jobId),
+      nativeToScVal(params.rating, { type: 'u32' }),
+      str(params.comment),
+    );
+    return toNum(unwrapResult(raw));
+  }
+
   // ── compliance: denylist (admin-managed, no redeploy) ─────────────────────
   /** Read the full denylist of blocked addresses. */
   async getDenylist(): Promise<string[]> {
@@ -717,6 +737,27 @@ export class MarketplaceClient {
 
   async getReviewsByIds(ids: number[]): Promise<Review[]> {
     return Promise.all(ids.map((id) => this.getReview(id)));
+  }
+
+  /** Fetch every review left for `reviewee` (paginated on-chain). */
+  async getReviewsForReviewee(
+    reviewee: string,
+    offset: number,
+    limit: number,
+  ): Promise<Review[]> {
+    const ids = await this.getReviewsByReviewee(reviewee, offset, limit);
+    return this.getReviewsByIds(ids);
+  }
+
+  /**
+   * Resolve the review (if any) left by `reviewer` for a given job.
+   * Returns `null` when the reviewer has not reviewed the job yet.
+   */
+  async getReviewForJob(jobId: number, reviewer: string): Promise<Review | null> {
+    const ids = await this.getReviewsByReviewee(reviewer, 0, 1000);
+    if (ids.length === 0) return null;
+    const reviews = await this.getReviewsByIds(ids);
+    return reviews.find((r) => r.jobId === jobId) ?? null;
   }
 }
 

@@ -1,3 +1,5 @@
+import { z } from 'zod';
+
 /**
  * IPFS upload utilities.
  *
@@ -9,6 +11,9 @@
  * Both backends require VITE_IPFS_API_KEY.
  * The public gateway used for building read-URLs is VITE_IPFS_GATEWAY.
  *
+ * An optional generic pinning service can be configured via
+ * VITE_PINNING_ENDPOINT (POSTs JSON, expects { cid } or { IpfsHash }).
+ *
  * For agent metadata we upload a JSON object.
  * For deliverable files we upload the raw File / Blob.
  */
@@ -19,6 +24,8 @@ export const IPFS_GATEWAY =
 const IPFS_API_KEY = import.meta.env.VITE_IPFS_API_KEY ?? '';
 const IPFS_PROVIDER: string =
   (import.meta.env.VITE_IPFS_PROVIDER as string | undefined) ?? 'pinata';
+const PINNING_ENDPOINT: string =
+  (import.meta.env.VITE_PINNING_ENDPOINT as string | undefined) ?? '';
 
 export interface UploadProgress {
   /** 0–100, or null while the XHR / fetch is in flight without progress info */
@@ -42,6 +49,87 @@ export function ipfsUriToUrl(uri: string): string {
 /** True when the app has an API key configured. */
 export function isIpfsConfigured(): boolean {
   return IPFS_API_KEY.length > 0;
+}
+
+/** True when a generic pinning endpoint is configured. */
+export function isPinningEndpointConfigured(): boolean {
+  return PINNING_ENDPOINT.length > 0;
+}
+
+// ── metadata schema & validation ───────────────────────────────────────────────
+
+/**
+ * URI validator: accepts only `ipfs://…` or `https://…` URIs.
+ */
+export const metadataUriSchema = z
+  .string()
+  .trim()
+  .min(1, 'Metadata URI is required')
+  .refine(
+    (uri) => uri.startsWith('ipfs://') || uri.startsWith('https://'),
+    'Metadata URI must start with ipfs:// or https://',
+  );
+
+/** True when `uri` is a valid metadata URI (ipfs:// or https://). */
+export function isValidMetadataUri(uri: string): boolean {
+  return metadataUriSchema.safeParse(uri).success;
+}
+
+const httpUrlSchema = z
+  .string()
+  .trim()
+  .url('Must be a valid URL')
+  .refine(
+    (url) => url.startsWith('https://') || url.startsWith('http://'),
+    'Must be an http(s) URL',
+  );
+
+/**
+ * Zod schema for agent metadata stored at `metadata_uri`.
+ */
+export const agentMetadataSchema = z.object({
+  name: z.string().trim().min(1, 'Name is required').max(100),
+  description: z.string().trim().max(2000).optional(),
+  avatar: metadataUriSchema.optional(),
+  links: z
+    .array(
+      z.object({
+        label: z.string().trim().min(1).max(50),
+        url: httpUrlSchema,
+      }),
+    )
+    .max(20)
+    .optional(),
+  portfolio: z
+    .array(
+      z.object({
+        title: z.string().trim().min(1).max(200),
+        url: httpUrlSchema,
+      }),
+    )
+    .max(50)
+    .optional(),
+});
+
+export type AgentMetadata = z.infer<typeof agentMetadataSchema>;
+
+export type ParseAgentMetadataResult =
+  | { ok: true; data: AgentMetadata }
+  | { ok: false; error: string };
+
+/**
+ * Validate unknown data against the agent metadata schema.
+ * Returns a typed result instead of throwing.
+ */
+export function parseAgentMetadata(input: unknown): ParseAgentMetadataResult {
+  const result = agentMetadataSchema.safeParse(input);
+  if (result.success) {
+    return { ok: true, data: result.data };
+  }
+  const error = result.error.issues
+    .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
+    .join('; ');
+  return { ok: false, error };
 }
 
 /**
@@ -148,6 +236,55 @@ export async function uploadJsonToIpfs(
     type: 'application/json',
   });
   return uploadToIpfs(blob, filename, onProgress);
+}
+
+/**
+ * Upload a JSON object to the configured generic pinning service
+ * (VITE_PINNING_ENDPOINT) and return a full `ipfs://<cid>` URI.
+ *
+ * The endpoint is expected to accept a JSON body and respond with either
+ * `{ cid }` or `{ IpfsHash }`.
+ */
+export async function uploadJsonToPinningService(
+  data: Record<string, unknown>,
+  onProgress?: (p: UploadProgress) => void,
+): Promise<string> {
+  if (!PINNING_ENDPOINT) {
+    throw new Error('Pinning endpoint is not configured (VITE_PINNING_ENDPOINT)');
+  }
+
+  onProgress?.({ percent: null, status: 'uploading' });
+
+  let cid: string;
+  try {
+    const res = await fetch(PINNING_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(IPFS_API_KEY ? { Authorization: `Bearer ${IPFS_API_KEY}` } : {}),
+      },
+      body: JSON.stringify(data),
+    });
+
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`Pinning service upload failed (${res.status}): ${body}`);
+    }
+
+    const json = (await res.json()) as { cid?: string; IpfsHash?: string };
+    const resultCid = json.cid ?? json.IpfsHash;
+    if (!resultCid) {
+      throw new Error('Pinning service response did not include a CID');
+    }
+    cid = resultCid;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    onProgress?.({ percent: null, status: 'error', error: message });
+    throw err;
+  }
+
+  onProgress?.({ percent: 100, status: 'done', cid });
+  return cidToUri(cid);
 }
 
 /**

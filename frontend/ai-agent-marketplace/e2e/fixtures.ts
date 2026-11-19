@@ -162,3 +162,149 @@ export function mockClientInitScript(): string {
 export async function enableMockContract(page: Page): Promise<void> {
   await page.addInitScript(mockClientInitScript());
 }
+
+/** Public key reported by the mocked Freighter wallet when connected. */
+export const MOCK_WALLET_PUBLIC_KEY =
+  'GA2CZ5K7PE4M9XQ1RT8VW3S6Y7Z8A9B0C1D2E3F4G5H6I7J8K9L0M1';
+
+/** Network passphrase reported by the mocked Freighter wallet. */
+export const MOCK_NETWORK_PASSPHRASE =
+  'Test SDF Network ; September 2015';
+
+/**
+ * Returns a self-contained JS snippet that installs a mocked Freighter wallet
+ * on `window.freighter` (and `window.freighterApi`). The snippet is evaluated
+ * by Playwright (via `page.addInitScript`) BEFORE the app mounts, so the
+ * wallet-gating logic sees a deterministic wallet regardless of whether a real
+ * extension is installed in CI.
+ *
+ * When `connected` is false, `isConnected`/`isAllowed` resolve to false and
+ * `getPublicKey` rejects, which is what the app treats as "wallet not
+ * connected" and uses to gate CreateJob / RegisterAgent.
+ */
+export function mockFreighterInitScript(connected: boolean): string {
+  const publicKey = JSON.stringify(MOCK_WALLET_PUBLIC_KEY);
+  const networkPassphrase = JSON.stringify(MOCK_NETWORK_PASSPHRASE);
+  return `(function () {
+  var connected = ${connected ? 'true' : 'false'};
+  var publicKey = ${publicKey};
+  var networkPassphrase = ${networkPassphrase};
+  var notConnectedError = new Error('Freighter is not connected');
+  var freighter = {
+    isConnected: function () { return Promise.resolve(connected); },
+    isAllowed: function () { return Promise.resolve(connected); },
+    getPublicKey: function () {
+      return connected ? Promise.resolve(publicKey) : Promise.reject(notConnectedError);
+    },
+    getNetwork: function () {
+      return Promise.resolve({ network: 'TESTNET', networkPassphrase: networkPassphrase });
+    },
+    getNetworkDetails: function () {
+      return Promise.resolve({
+        network: 'TESTNET',
+        networkUrl: 'https://horizon-testnet.stellar.org',
+        networkPassphrase: networkPassphrase,
+        sorobanRpcUrl: 'https://soroban-testnet.stellar.org'
+      });
+    },
+    signTransaction: function (xdr) {
+      return connected
+        ? Promise.resolve({ signedTxXdr: xdr, signerAddress: publicKey })
+        : Promise.reject(notConnectedError);
+    },
+    signAuthEntry: function (entry) {
+      return connected
+        ? Promise.resolve({ signedAuthEntry: entry, signerAddress: publicKey })
+        : Promise.reject(notConnectedError);
+    },
+    signMessage: function (message) {
+      return connected
+        ? Promise.resolve({ signedMessage: message, signerAddress: publicKey })
+        : Promise.reject(notConnectedError);
+    },
+    requestAccess: function () {
+      return connected ? Promise.resolve(publicKey) : Promise.reject(notConnectedError);
+    }
+  };
+  window.freighter = freighter;
+  window.freighterApi = freighter;
+})();`;
+}
+
+/**
+ * Installs a mocked Freighter wallet that reports a connected account for
+ * every navigation of `page`. Must be called before navigating.
+ */
+export async function mockFreighterConnected(page: Page): Promise<void> {
+  await page.addInitScript(mockFreighterInitScript(true));
+}
+
+/**
+ * Installs a mocked Freighter wallet that reports no connected account for
+ * every navigation of `page`. Must be called before navigating.
+ */
+export async function mockFreighterDisconnected(page: Page): Promise<void> {
+  await page.addInitScript(mockFreighterInitScript(false));
+}
+
+/**
+ * Returns a self-contained JS snippet that stubs the Soroban RPC transport so
+ * contract simulations resolve deterministically without network access.
+ *
+ * `rpc` is a JSON-serialisable map of method name -> result value. Supported
+ * keys mirror the Soroban RPC methods the app may call:
+ *   - `getLatestLedger`  -> ledger sequence object
+ *   - `getLedgerEntries` -> `{ entries: [] }`
+ *   - `getAccount`       -> account object
+ *   - `simulateTransaction` -> `{ results: [], latestLedger }`
+ *   - `sendTransaction`  -> `{ status: 'PENDING', hash }`
+ *   - `getTransaction`   -> `{ status: 'SUCCESS' }`
+ * Any method not present in the map resolves to a benign default.
+ */
+export function mockRpcInitScript(
+  rpc: Record<string, unknown> = {},
+): string {
+  const overrides = JSON.stringify(rpc);
+  return `(function () {
+  var overrides = ${overrides};
+  var defaults = {
+    getLatestLedger: { sequence: 1000, id: 'mock-ledger', protocolVersion: 21 },
+    getLedgerEntries: { entries: [], latestLedger: 1000 },
+    getAccount: { id: 'mock-account', sequence: '1' },
+    simulateTransaction: { results: [], latestLedger: 1000 },
+    sendTransaction: { status: 'PENDING', hash: 'mock-tx-hash' },
+    getTransaction: { status: 'SUCCESS', latestLedger: 1000 }
+  };
+  var resolveResult = function (method) {
+    if (Object.prototype.hasOwnProperty.call(overrides, method)) {
+      return overrides[method];
+    }
+    if (Object.prototype.hasOwnProperty.call(defaults, method)) {
+      return defaults[method];
+    }
+    return null;
+  };
+  var rpcServer = {
+    getLatestLedger: function () { return Promise.resolve(resolveResult('getLatestLedger')); },
+    getLedgerEntries: function () { return Promise.resolve(resolveResult('getLedgerEntries')); },
+    getAccount: function () { return Promise.resolve(resolveResult('getAccount')); },
+    simulateTransaction: function () { return Promise.resolve(resolveResult('simulateTransaction')); },
+    sendTransaction: function () { return Promise.resolve(resolveResult('sendTransaction')); },
+    getTransaction: function () { return Promise.resolve(resolveResult('getTransaction')); }
+  };
+  window.__E2E_SOROBAN_RPC__ = rpcServer;
+  window.__E2E_SOROBAN_RPC_RESULT__ = resolveResult;
+})();`;
+}
+
+/**
+ * Installs a mocked Soroban RPC transport for every navigation of `page`.
+ * Must be called before navigating. Pass a map of method name -> result to
+ * override the deterministic defaults.
+ */
+export async function mockRpc(
+  page: Page,
+  rpc: Record<string, unknown> = {},
+): Promise<void> {
+  await page.addInitScript(mockRpcInitScript(rpc));
+}

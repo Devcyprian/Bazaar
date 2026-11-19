@@ -25,6 +25,12 @@ import {
   isIpfsConfigured,
   type UploadProgress,
 } from '@/lib/ipfs';
+import {
+  AgentMetadataSchema,
+  metadataUriSchema,
+  isPinningConfigured,
+  uploadMetadataToPinningService,
+} from '@/lib/agentMetadata';
 
 // ── Skill data ────────────────────────────────────────────────────────────────
 
@@ -52,8 +58,8 @@ const registerAgentSchema = z.object({
     .string()
     .optional()
     .refine(
-      (v) => !v || v.startsWith('https://') || v.startsWith('ipfs://'),
-      'Must start with https:// or ipfs://',
+      (v) => !v || metadataUriSchema.safeParse(v).success,
+      'Must be a valid ipfs:// or https:// URI',
     ),
 });
 
@@ -80,6 +86,8 @@ export const RegisterAgent: React.FC = () => {
   const [ipfsProgress, setIpfsProgress] = useState<UploadProgress>({ percent: null, status: 'idle' });
   const [uploadedCid, setUploadedCid] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [metadataError, setMetadataError] = useState<string | null>(null);
+  const [isPinning, setIsPinning] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const {
@@ -143,20 +151,58 @@ export const RegisterAgent: React.FC = () => {
     };
   };
 
+  /** Validate the built metadata JSON against the AgentMetadata schema. */
+  const validateMetadata = (metadata: Record<string, unknown>): boolean => {
+    const result = AgentMetadataSchema.safeParse(metadata);
+    if (!result.success) {
+      const first = result.error.issues[0];
+      setMetadataError(
+        first ? `${first.path.join('.') || 'metadata'}: ${first.message}` : 'Invalid metadata',
+      );
+      return false;
+    }
+    setMetadataError(null);
+    return true;
+  };
+
   const handleUploadJson = async () => {
     if (!isIpfsConfigured()) {
       alert('VITE_IPFS_API_KEY is not set. Add it to your .env.local file and restart the dev server.');
       return;
     }
+    const metadata = buildMetadataJson();
+    if (!validateMetadata(metadata)) return;
     setIpfsProgress({ percent: null, status: 'uploading' });
     setUploadedCid(null);
     try {
-      const metadata = buildMetadataJson();
       const cid = await uploadJsonToIpfs(metadata, 'agent-metadata.json', setIpfsProgress);
       setUploadedCid(cid);
       setValue('metadataUri', cidToUri(cid), { shouldValidate: true });
     } catch (err) {
       console.error('IPFS JSON upload failed:', err);
+    }
+  };
+
+  const handlePinningUpload = async () => {
+    if (!isPinningConfigured()) {
+      alert(
+        'VITE_PINNING_SERVICE_URL is not set. Add it to your .env.local file and restart the dev server.',
+      );
+      return;
+    }
+    const metadata = buildMetadataJson();
+    if (!validateMetadata(metadata)) return;
+    setIsPinning(true);
+    setMetadataError(null);
+    try {
+      const uri = await uploadMetadataToPinningService(metadata);
+      setValue('metadataUri', uri, { shouldValidate: true });
+    } catch (err) {
+      setMetadataError(
+        err instanceof Error ? err.message : 'Failed to upload to pinning service',
+      );
+    } finally {
+      setIsPinning(false);
     }
   };
 
@@ -188,6 +234,7 @@ export const RegisterAgent: React.FC = () => {
     setUploadedCid(null);
     setIpfsProgress({ percent: null, status: 'idle' });
     setSelectedFile(null);
+    setMetadataError(null);
     setValue('metadataUri', '', { shouldValidate: false });
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
@@ -399,21 +446,50 @@ export const RegisterAgent: React.FC = () => {
                     This JSON is built from the form fields above and uploaded to IPFS when you
                     click the button below.
                   </p>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={handleUploadJson}
-                    disabled={isUploading || !nameValue || !descValue}
-                    className="gap-2"
-                    aria-label="Upload metadata JSON to IPFS"
-                  >
-                    {isUploading ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Upload className="h-4 w-4" />
-                    )}
-                    {isUploading ? 'Uploading…' : 'Upload Metadata to IPFS'}
-                  </Button>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={handleUploadJson}
+                      disabled={isUploading || isPinning || !nameValue || !descValue}
+                      className="gap-2"
+                      aria-label="Upload metadata JSON to IPFS"
+                    >
+                      {isUploading ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Upload className="h-4 w-4" />
+                      )}
+                      {isUploading ? 'Uploading…' : 'Upload Metadata to IPFS'}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={handlePinningUpload}
+                      disabled={isUploading || isPinning || !nameValue || !descValue}
+                      className="gap-2"
+                      aria-label="Upload metadata to pinning service"
+                    >
+                      {isPinning ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Globe className="h-4 w-4" />
+                      )}
+                      {isPinning ? 'Pinning…' : 'Upload to pinning service'}
+                    </Button>
+                  </div>
+                  {metadataError && (
+                    <div
+                      className="flex items-start gap-3 p-3 bg-destructive/10 border border-destructive/20 rounded-lg"
+                      role="alert"
+                    >
+                      <AlertCircle className="h-4 w-4 text-destructive flex-shrink-0 mt-0.5" />
+                      <div className="text-sm">
+                        <p className="font-medium text-destructive">Invalid metadata</p>
+                        <p className="text-xs text-muted-foreground mt-0.5">{metadataError}</p>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -493,6 +569,19 @@ export const RegisterAgent: React.FC = () => {
                   {...register('metadataUri')}
                   error={errors.metadataUri?.message}
                 />
+              )}
+
+              {metadataError && uploadMode !== 'json-editor' && (
+                <div
+                  className="flex items-start gap-3 p-3 bg-destructive/10 border border-destructive/20 rounded-lg"
+                  role="alert"
+                >
+                  <AlertCircle className="h-4 w-4 text-destructive flex-shrink-0 mt-0.5" />
+                  <div className="text-sm">
+                    <p className="font-medium text-destructive">Invalid metadata</p>
+                    <p className="text-xs text-muted-foreground mt-0.5">{metadataError}</p>
+                  </div>
+                </div>
               )}
 
               {/* ── Upload progress / result ── */}
@@ -754,7 +843,7 @@ export const RegisterAgent: React.FC = () => {
             <Button
               type="submit"
               className="w-full md:w-auto"
-              disabled={isSubmitting || isUploading}
+              disabled={isSubmitting || isUploading || isPinning}
               isLoading={isSubmitting}
             >
               <Send className="h-4 w-4 mr-2" />

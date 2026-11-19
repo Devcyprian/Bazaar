@@ -3,13 +3,12 @@ import { Link } from 'react-router-dom';
 import { Button } from '@/components/ui/Button';
 import { Card, CardContent } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
-import { 
-  Brain, Shield, Zap, Globe, Users, DollarSign, 
-  ArrowRight, CheckCircle, Star, Code, Terminal, 
+import {
+  Brain, Shield, Zap, Globe, Users, DollarSign,
+  CheckCircle, Code, Terminal,
   BarChart3, Lock, Send, Clock, Search, TrendingUp,
-  Wallet, Activity, FileText, MessageSquare
+  Activity, FileText, MessageSquare
 } from 'lucide-react';
-import { clsx } from 'clsx';
 import { useStellar } from '@/hooks/useStellar';
 import { MarketplaceClient } from '@/lib/marketplaceClient';
 
