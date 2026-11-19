@@ -1316,6 +1316,538 @@ fn test_get_reviews_by_reviewee_pagination() {
     assert_eq!(empty.len(), 0);
 }
 
+// ==================== #169: Missing recipient trustline ====================
+
+/// When the agent has no USDC trustline at approval time, `approve_deliverable`
+/// must not trap funds: it records a claimable balance that the agent can
+/// withdraw once the trustline exists.
+#[test]
+fn test_approve_deliverable_without_trustline_records_claimable() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+    let usdc_client = TokenClient::new(&e, &usdc.address());
+
+    let admin_client = TokenAdminClient::new(&e, &usdc.address());
+    admin_client.mint(&client_addr, &200_000_000);
+
+    // NOTE: the agent_owner deliberately has no trustline for USDC.
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &50_000_000,
+        &String::from_str(&e, "ipfs://QmTest"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &100_000_000,
+        &14,
+    );
+
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(&e, "Proposal"),
+    );
+
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    let hash = BytesN::from_array(&e, &[1u8; 32]);
+    marketplace.submit_deliverable(&agent_owner, &job_id, &hash);
+
+    // Approval must succeed even though the agent cannot receive USDC yet.
+    marketplace.approve_deliverable(&client_addr, &job_id);
+
+    // Funds are not trapped: they are held as a claimable balance for the agent.
+    let claimable = marketplace.get_claimable(&agent_owner);
+    assert_eq!(claimable, 80_000_000);
+    assert_eq!(usdc_client.balance(&agent_owner), 0);
+
+    // Once the agent creates a trustline, they can claim the funds.
+    admin_client.mint(&agent_owner, &0); // establishes trustline via SAC admin
+    marketplace.claim_funds(&agent_owner);
+
+    assert_eq!(usdc_client.balance(&agent_owner), 80_000_000);
+    assert_eq!(marketplace.get_claimable(&agent_owner), 0);
+}
+
+/// `accept_bid` must refuse to escrow funds for an agent that cannot be paid.
+#[test]
+fn test_accept_bid_rejected_when_agent_not_payable() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let admin_client = TokenAdminClient::new(&e, &usdc.address());
+    admin_client.mint(&client_addr, &200_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &50_000_000,
+        &String::from_str(&e, "ipfs://QmTest"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &100_000_000,
+        &14,
+    );
+
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(&e, "Proposal"),
+    );
+
+    // Agent has no trustline -> accept_bid must be rejected.
+    let result = marketplace.try_accept_bid(&client_addr, &job_id, &bid_id);
+    assert!(result.is_err());
+
+    // Job remains open and no escrow was created.
+    let job = marketplace.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Open);
+    assert!(marketplace.get_escrow_by_job(&job_id).is_none());
+}
+
+// ==================== #170: Dispute timeout fallback ====================
+
+/// Helper: sets up a disputed job and returns (marketplace, usdc_client,
+/// client, agent, job_id, dispute_id).
+fn setup_disputed_job<'a>(
+    e: &Env,
+) -> (
+    AiAgentMarketplaceClient<'a>,
+    TokenClient<'a>,
+    Address,
+    Address,
+    u64,
+    u64,
+) {
+    let admin = Address::generate(e);
+    let client_addr = Address::generate(e);
+    let agent_owner = Address::generate(e);
+    let usdc = create_token_contract(e);
+    let marketplace = create_marketplace_contract(e, &admin, &usdc.address());
+    let usdc_client = TokenClient::new(e, &usdc.address());
+
+    let admin_client = TokenAdminClient::new(e, &usdc.address());
+    admin_client.mint(&client_addr, &200_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(e, "Agent"),
+        &String::from_str(e, "Desc"),
+        &Vec::from_array(e, [String::from_str(e, "python")]),
+        &50_000_000,
+        &String::from_str(e, "ipfs://QmTest"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(e, "Job"),
+        &String::from_str(e, "Desc"),
+        &Vec::from_array(e, [String::from_str(e, "python")]),
+        &100_000_000,
+        &14,
+    );
+
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(e, "Proposal"),
+    );
+
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    let hash = BytesN::from_array(e, &[1u8; 32]);
+    marketplace.submit_deliverable(&agent_owner, &job_id, &hash);
+
+    let dispute_id = marketplace.raise_dispute(
+        &client_addr,
+        &job_id,
+        &String::from_str(e, "Dispute"),
+        &String::from_str(e, "ipfs://QmEvidence"),
+    );
+
+    (marketplace, usdc_client, client_addr, agent_owner, job_id, dispute_id)
+}
+
+#[test]
+fn test_dispute_fallback_blocked_before_deadline() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, client_addr, _agent, _job_id, dispute_id) =
+        setup_disputed_job(&e);
+
+    // Just before the dispute window closes (7 days) -> still blocked.
+    e.ledger().with_mut(|li| {
+        li.timestamp += 7 * 86_400 - 1;
+    });
+
+    let result = marketplace.try_resolve_dispute_fallback(&client_addr, &dispute_id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_dispute_fallback_blocked_at_boundary() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, client_addr, _agent, _job_id, dispute_id) =
+        setup_disputed_job(&e);
+
+    // Exactly at the boundary -> still blocked (window must have elapsed).
+    e.ledger().with_mut(|li| {
+        li.timestamp += 7 * 86_400;
+    });
+
+    let result = marketplace.try_resolve_dispute_fallback(&client_addr, &dispute_id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_dispute_fallback_after_deadline_by_client() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, usdc_client, client_addr, agent_owner, job_id, dispute_id) =
+        setup_disputed_job(&e);
+
+    // Past the dispute window -> either party may trigger the fallback.
+    e.ledger().with_mut(|li| {
+        li.timestamp += 7 * 86_400 + 1;
+    });
+
+    marketplace.resolve_dispute_fallback(&client_addr, &dispute_id);
+
+    let job = marketplace.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Completed);
+
+    // Deterministic split: agent receives the escrowed amount.
+    assert_eq!(usdc_client.balance(&agent_owner), 80_000_000);
+}
+
+#[test]
+fn test_dispute_fallback_after_deadline_by_agent() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, usdc_client, _client, agent_owner, job_id, dispute_id) =
+        setup_disputed_job(&e);
+
+    e.ledger().with_mut(|li| {
+        li.timestamp += 7 * 86_400 + 1;
+    });
+
+    // The agent (the other party) can also trigger the fallback.
+    marketplace.resolve_dispute_fallback(&agent_owner, &dispute_id);
+
+    let job = marketplace.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Completed);
+    assert_eq!(usdc_client.balance(&agent_owner), 80_000_000);
+}
+
+// ==================== #171: Job deadline reclaim ====================
+
+#[test]
+fn test_reclaim_escrow_after_deadline() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+    let usdc_client = TokenClient::new(&e, &usdc.address());
+
+    let admin_client = TokenAdminClient::new(&e, &usdc.address());
+    admin_client.mint(&client_addr, &100_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &50_000_000,
+        &String::from_str(&e, "ipfs://QmTest"),
+    );
+
+    // 14-day job deadline.
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &100_000_000,
+        &14,
+    );
+
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(&e, "Proposal"),
+    );
+
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    // Advance past the job deadline with no accepted deliverable.
+    e.ledger().with_mut(|li| {
+        li.timestamp += 14 * 86_400 + 1;
+    });
+
+    marketplace.reclaim_escrow(&client_addr, &job_id);
+
+    let job = marketplace.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Refunded);
+    assert_eq!(usdc_client.balance(&client_addr), 80_000_000);
+}
+
+#[test]
+fn test_reclaim_escrow_before_deadline_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let admin_client = TokenAdminClient::new(&e, &usdc.address());
+    admin_client.mint(&client_addr, &100_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &50_000_000,
+        &String::from_str(&e, "ipfs://QmTest"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &100_000_000,
+        &14,
+    );
+
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(&e, "Proposal"),
+    );
+
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    // Still within the deadline -> reclaim must fail.
+    let result = marketplace.try_reclaim_escrow(&client_addr, &job_id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_reclaim_escrow_after_approval_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let admin_client = TokenAdminClient::new(&e, &usdc.address());
+    admin_client.mint(&client_addr, &100_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &50_000_000,
+        &String::from_str(&e, "ipfs://QmTest"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &100_000_000,
+        &14,
+    );
+
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(&e, "Proposal"),
+    );
+
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    let hash = BytesN::from_array(&e, &[1u8; 32]);
+    marketplace.submit_deliverable(&agent_owner, &job_id, &hash);
+    marketplace.approve_deliverable(&client_addr, &job_id);
+
+    // Even past the deadline, an approved job cannot be reclaimed.
+    e.ledger().with_mut(|li| {
+        li.timestamp += 14 * 86_400 + 1;
+    });
+
+    let result = marketplace.try_reclaim_escrow(&client_addr, &job_id);
+    assert!(result.is_err());
+}
+
+// ==================== #172: TTL extension ====================
+
+#[test]
+fn test_persistent_entries_survive_ledger_advance() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let admin_client = TokenAdminClient::new(&e, &usdc.address());
+    admin_client.mint(&client_addr, &100_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &50_000_000,
+        &String::from_str(&e, "ipfs://QmTest"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &100_000_000,
+        &14,
+    );
+
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(&e, "Proposal"),
+    );
+
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    // Advance the ledger sequence; persistent entries must remain readable.
+    e.ledger().with_mut(|l| {
+        l.sequence_number += 100_000;
+    });
+
+    let job = marketplace.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::InProgress);
+    let escrow = marketplace.get_escrow_by_job(&job_id);
+    assert!(escrow.is_some());
+    assert_eq!(escrow.unwrap().status, EscrowStatus::Funded);
+}
+
+#[test]
+fn test_bump_ttl_extends_open_escrow() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let admin_client = TokenAdminClient::new(&e, &usdc.address());
+    admin_client.mint(&client_addr, &100_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &50_000_000,
+        &String::from_str(&e, "ipfs://QmTest"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &100_000_000,
+        &14,
+    );
+
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(&e, "Proposal"),
+    );
+
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    // Keeper-style bump of the open escrow's TTL.
+    marketplace.bump_ttl(&job_id);
+
+    // Advance the ledger and confirm the entry is still readable.
+    e.ledger().with_mut(|l| {
+        l.sequence_number += 100_000;
+    });
+
+    let escrow = marketplace.get_escrow_by_job(&job_id);
+    assert!(escrow.is_some());
+    assert_eq!(escrow.unwrap().status, EscrowStatus::Funded);
+}
+
 #[test]
 fn test_get_jobs_by_client_pagination_boundaries() {
     let e = Env::default();
