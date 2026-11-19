@@ -936,7 +936,118 @@ fn test_reclaim_expired_escrow_not_expired() {
     // Do NOT advance time -- escrow is still within the expiry window
     // Attempting to reclaim should return EscrowExpired error
     let result = marketplace.try_reclaim_expired_escrow(&client_addr, &job_id);
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(Error::EscrowExpired)));
+}
+
+#[test]
+fn test_reclaim_expired_escrow_unauthorized() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    // Mint USDC
+    let admin_client = TokenAdminClient::new(&e, &usdc.address());
+    admin_client.mint(&client_addr, &100_000_000);
+
+    // Register agent, post job, place & accept bid
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &50_000_000,
+        &String::from_str(&e, "ipfs://QmTest"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &100_000_000,
+        &14,
+    );
+
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(&e, "Proposal"),
+    );
+
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    // Advance the ledger past the 30-day expiry window
+    e.ledger().with_mut(|li| {
+        li.timestamp += 30 * 86_400 + 1;
+    });
+
+    // A non-client caller must be rejected with Unauthorized
+    let result = marketplace.try_reclaim_expired_escrow(&agent_owner, &job_id);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_reclaim_expired_escrow_not_funded() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    // Mint USDC
+    let admin_client = TokenAdminClient::new(&e, &usdc.address());
+    admin_client.mint(&client_addr, &100_000_000);
+
+    // Register agent, post job, place & accept bid
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &50_000_000,
+        &String::from_str(&e, "ipfs://QmTest"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &100_000_000,
+        &14,
+    );
+
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(&e, "Proposal"),
+    );
+
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    // Advance the ledger past the 30-day expiry window
+    e.ledger().with_mut(|li| {
+        li.timestamp += 30 * 86_400 + 1;
+    });
+
+    // First reclaim succeeds and refunds the escrow
+    marketplace.reclaim_expired_escrow(&client_addr, &job_id);
+
+    // A second reclaim on the now-refunded escrow must fail with EscrowNotFunded
+    let result = marketplace.try_reclaim_expired_escrow(&client_addr, &job_id);
+    assert_eq!(result, Err(Ok(Error::EscrowNotFunded)));
 }
 
 // ==================== Pagination Tests ====================
@@ -1203,6 +1314,311 @@ fn test_get_reviews_by_reviewee_pagination() {
     // Out of bounds
     let empty = marketplace.get_reviews_by_reviewee(&agent_owner, &99, &2);
     assert_eq!(empty.len(), 0);
+}
+
+#[test]
+fn test_get_jobs_by_client_pagination_boundaries() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    // Post 3 jobs
+    for _ in 0..3 {
+        marketplace.post_job(
+            &client_addr,
+            &String::from_str(&e, "Job"),
+            &String::from_str(&e, "Desc"),
+            &Vec::new(&e),
+            &10_000_000,
+            &1,
+        );
+    }
+
+    // Normal slice: offset 0, limit < len
+    let page = marketplace.get_jobs_by_client(&client_addr, &0, &2);
+    assert_eq!(page.len(), 2);
+    assert_eq!(page.get(0).unwrap(), 1u64);
+    assert_eq!(page.get(1).unwrap(), 2u64);
+
+    // Limit exceeding remaining length -> returns remaining elements
+    let rest = marketplace.get_jobs_by_client(&client_addr, &1, &100);
+    assert_eq!(rest.len(), 2);
+    assert_eq!(rest.get(0).unwrap(), 2u64);
+    assert_eq!(rest.get(1).unwrap(), 3u64);
+
+    // Offset exactly at boundary (offset == len) -> empty
+    let at_end = marketplace.get_jobs_by_client(&client_addr, &3, &2);
+    assert_eq!(at_end.len(), 0);
+
+    // Offset beyond length -> empty
+    let beyond = marketplace.get_jobs_by_client(&client_addr, &100, &2);
+    assert_eq!(beyond.len(), 0);
+
+    // Limit == 0 -> empty
+    let zero = marketplace.get_jobs_by_client(&client_addr, &0, &0);
+    assert_eq!(zero.len(), 0);
+}
+
+#[test]
+fn test_get_jobs_by_agent_pagination_boundaries() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let admin_token = TokenAdminClient::new(&e, &usdc.address());
+    admin_token.mint(&client_addr, &1_000_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &String::from_str(&e, "ipfs://test"),
+    );
+
+    // Post & accept 3 jobs so they appear under agent's index
+    for _ in 0..3 {
+        let job_id = marketplace.post_job(
+            &client_addr,
+            &String::from_str(&e, "Job"),
+            &String::from_str(&e, "Desc"),
+            &Vec::new(&e),
+            &10_000_000,
+            &1,
+        );
+        let bid_id = marketplace.place_bid(
+            &agent_owner,
+            &job_id,
+            &10_000_000,
+            &1,
+            &String::from_str(&e, "Prop"),
+        );
+        marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+    }
+
+    // Normal slice: offset 0, limit < len
+    let page = marketplace.get_jobs_by_agent(&agent_owner, &0, &2);
+    assert_eq!(page.len(), 2);
+
+    // Limit exceeding remaining length -> returns remaining elements
+    let rest = marketplace.get_jobs_by_agent(&agent_owner, &1, &100);
+    assert_eq!(rest.len(), 2);
+
+    // Offset exactly at boundary (offset == len) -> empty
+    let at_end = marketplace.get_jobs_by_agent(&agent_owner, &3, &2);
+    assert_eq!(at_end.len(), 0);
+
+    // Offset beyond length -> empty
+    let beyond = marketplace.get_jobs_by_agent(&agent_owner, &100, &2);
+    assert_eq!(beyond.len(), 0);
+
+    // Limit == 0 -> empty
+    let zero = marketplace.get_jobs_by_agent(&agent_owner, &0, &0);
+    assert_eq!(zero.len(), 0);
+}
+
+#[test]
+fn test_get_bids_by_job_pagination_boundaries() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    // Post one job
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &1,
+    );
+
+    // Register 3 agents and place bids
+    for _ in 0..3 {
+        let owner = Address::generate(&e);
+        marketplace.register_agent(
+            &owner,
+            &String::from_str(&e, "Agent"),
+            &String::from_str(&e, "Desc"),
+            &Vec::new(&e),
+            &10_000_000,
+            &String::from_str(&e, "ipfs://test"),
+        );
+        marketplace.place_bid(
+            &owner,
+            &job_id,
+            &10_000_000,
+            &1,
+            &String::from_str(&e, "Proposal"),
+        );
+    }
+
+    // Normal slice: offset 0, limit < len
+    let page = marketplace.get_bids_by_job(&job_id, &0, &2);
+    assert_eq!(page.len(), 2);
+
+    // Limit exceeding remaining length -> returns remaining elements
+    let rest = marketplace.get_bids_by_job(&job_id, &1, &100);
+    assert_eq!(rest.len(), 2);
+
+    // Offset exactly at boundary (offset == len) -> empty
+    let at_end = marketplace.get_bids_by_job(&job_id, &3, &2);
+    assert_eq!(at_end.len(), 0);
+
+    // Offset beyond length -> empty
+    let beyond = marketplace.get_bids_by_job(&job_id, &100, &2);
+    assert_eq!(beyond.len(), 0);
+
+    // Limit == 0 -> empty
+    let zero = marketplace.get_bids_by_job(&job_id, &0, &0);
+    assert_eq!(zero.len(), 0);
+}
+
+#[test]
+fn test_get_bids_by_agent_pagination_boundaries() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &String::from_str(&e, "ipfs://test"),
+    );
+
+    // Place bids on 3 different jobs
+    for _ in 0..3 {
+        let job_id = marketplace.post_job(
+            &client_addr,
+            &String::from_str(&e, "Job"),
+            &String::from_str(&e, "Desc"),
+            &Vec::new(&e),
+            &10_000_000,
+            &1,
+        );
+        marketplace.place_bid(
+            &agent_owner,
+            &job_id,
+            &10_000_000,
+            &1,
+            &String::from_str(&e, "Prop"),
+        );
+    }
+
+    // Normal slice: offset 0, limit < len
+    let page = marketplace.get_bids_by_agent(&agent_owner, &0, &2);
+    assert_eq!(page.len(), 2);
+
+    // Limit exceeding remaining length -> returns remaining elements
+    let rest = marketplace.get_bids_by_agent(&agent_owner, &1, &100);
+    assert_eq!(rest.len(), 2);
+
+    // Offset exactly at boundary (offset == len) -> empty
+    let at_end = marketplace.get_bids_by_agent(&agent_owner, &3, &2);
+    assert_eq!(at_end.len(), 0);
+
+    // Offset beyond length -> empty
+    let beyond = marketplace.get_bids_by_agent(&agent_owner, &100, &2);
+    assert_eq!(beyond.len(), 0);
+
+    // Limit == 0 -> empty
+    let zero = marketplace.get_bids_by_agent(&agent_owner, &0, &0);
+    assert_eq!(zero.len(), 0);
+}
+
+#[test]
+fn test_get_reviews_by_reviewee_pagination_boundaries() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let admin_token = TokenAdminClient::new(&e, &usdc.address());
+    admin_token.mint(&client_addr, &1_000_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &String::from_str(&e, "ipfs://test"),
+    );
+
+    // Complete 3 jobs and leave reviews on each
+    for _ in 0..3 {
+        let job_id = marketplace.post_job(
+            &client_addr,
+            &String::from_str(&e, "Job"),
+            &String::from_str(&e, "Desc"),
+            &Vec::new(&e),
+            &10_000_000,
+            &1,
+        );
+        let bid_id = marketplace.place_bid(
+            &agent_owner,
+            &job_id,
+            &10_000_000,
+            &1,
+            &String::from_str(&e, "Prop"),
+        );
+        marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+        let hash = BytesN::from_array(&e, &[1u8; 32]);
+        marketplace.submit_deliverable(&agent_owner, &job_id, &hash);
+        marketplace.approve_deliverable(&client_addr, &job_id);
+        marketplace.leave_review(
+            &client_addr,
+            &job_id,
+            &5,
+            &String::from_str(&e, "Great work!"),
+        );
+    }
+
+    // Normal slice: offset 0, limit < len
+    let page = marketplace.get_reviews_by_reviewee(&agent_owner, &0, &2);
+    assert_eq!(page.len(), 2);
+
+    // Limit exceeding remaining length -> returns remaining elements
+    let rest = marketplace.get_reviews_by_reviewee(&agent_owner, &1, &100);
+    assert_eq!(rest.len(), 2);
+
+    // Offset exactly at boundary (offset == len) -> empty
+    let at_end = marketplace.get_reviews_by_reviewee(&agent_owner, &3, &2);
+    assert_eq!(at_end.len(), 0);
+
+    // Offset beyond length -> empty
+    let beyond = marketplace.get_reviews_by_reviewee(&agent_owner, &100, &2);
+    assert_eq!(beyond.len(), 0);
+
+    // Limit == 0 -> empty
+    let zero = marketplace.get_reviews_by_reviewee(&agent_owner, &0, &0);
+    assert_eq!(zero.len(), 0);
 }
 
 #[test]

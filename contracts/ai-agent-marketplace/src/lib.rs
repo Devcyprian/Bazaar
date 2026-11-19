@@ -1481,8 +1481,8 @@ impl AiAgentMarketplace {
         let expiry_seconds = config.escrow_expiry_days * 86_400;
         let expiry_time = escrow.created_at + expiry_seconds;
         if env.ledger().timestamp() <= expiry_time {
-        // Note: EscrowExpired is repurposed here to mean 'not yet expired / too early to reclaim'.
-        // A future refactor may introduce a dedicated EscrowNotExpired error variant.
+            // EscrowExpired is repurposed here to mean 'not yet expired / too early to reclaim'.
+            // A future refactor may introduce a dedicated EscrowNotExpired error variant.
             return Err(Error::EscrowExpired);
         }
 
@@ -1855,11 +1855,11 @@ impl AiAgentMarketplace {
         if limit == 0 || offset >= total {
             return Vec::new(env);
         }
-        let start = offset as u32;
-        let end_exclusive = ((offset + limit).min(total)) as u32;
+        let start = offset.min(total);
+        let end_exclusive = (start + limit).min(total);
         let mut page = Vec::new(env);
         for i in start..end_exclusive {
-            page.push_back(all.get(i).unwrap());
+            page.push_back(all.get(i as u32).unwrap());
         }
         page
     }

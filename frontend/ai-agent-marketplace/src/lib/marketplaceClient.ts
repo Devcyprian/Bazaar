@@ -481,20 +481,30 @@ export class MarketplaceClient {
   }
 
   // ── paginated id indexes (Vec<u64>) ────────────────────────────────────────
+  // Each accepts `offset`/`limit` and forwards them as trailing u64 args so the
+  // contract returns a bounded slice instead of the full stored Vec.
   async getJobsByClient(client: string, offset: number, limit: number): Promise<number[]> {
-    return toIdArray(await this.call('get_jobs_by_client', addr(client), u64(offset), u64(limit)));
+    return toIdArray(
+      await this.call('get_jobs_by_client', addr(client), u64(offset), u64(limit)),
+    );
   }
 
   async getJobsByAgent(agent: string, offset: number, limit: number): Promise<number[]> {
-    return toIdArray(await this.call('get_jobs_by_agent', addr(agent), u64(offset), u64(limit)));
+    return toIdArray(
+      await this.call('get_jobs_by_agent', addr(agent), u64(offset), u64(limit)),
+    );
   }
 
   async getBidsByJob(jobId: number, offset: number, limit: number): Promise<number[]> {
-    return toIdArray(await this.call('get_bids_by_job', u64(jobId), u64(offset), u64(limit)));
+    return toIdArray(
+      await this.call('get_bids_by_job', u64(jobId), u64(offset), u64(limit)),
+    );
   }
 
   async getBidsByAgent(agent: string, offset: number, limit: number): Promise<number[]> {
-    return toIdArray(await this.call('get_bids_by_agent', addr(agent), u64(offset), u64(limit)));
+    return toIdArray(
+      await this.call('get_bids_by_agent', addr(agent), u64(offset), u64(limit)),
+    );
   }
 
   async getReviewsByReviewee(reviewee: string, offset: number, limit: number): Promise<number[]> {

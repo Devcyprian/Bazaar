@@ -22,6 +22,32 @@ export type JobStatus =
 
 export type BidStatus = 'Pending' | 'Accepted' | 'Rejected' | 'Withdrawn';
 
+/**
+ * Offset/limit parameters for paginated contract queries.
+ *
+ * Mirrors the on-chain signatures, e.g.
+ * `get_jobs_by_client(env, client, offset, limit)`.
+ */
+export interface PageParams {
+  offset: number;
+  limit: number;
+}
+
+/**
+ * A single page of results returned by a paginated contract query.
+ *
+ * `items` is the slice returned by the contract (empty when `offset` is out of
+ * bounds). `offset`/`limit` echo the request so infinite-scroll hooks can
+ * compute the next page, and `hasMore` indicates whether another page may
+ * exist (i.e. the returned page was full).
+ */
+export interface PaginatedResult<T> {
+  items: T[];
+  offset: number;
+  limit: number;
+  hasMore: boolean;
+}
+
 export type EscrowStatus = 'Funded' | 'Released' | 'Disputed' | 'Refunded';
 
 export interface Agent {
@@ -71,6 +97,12 @@ export interface Job {
    * when available, otherwise `null`.
    */
   escrowCreatedAt: number | null;
+  /**
+   * Current status of the linked escrow, populated from `getEscrowByJob` when
+   * available, otherwise `null`. Used by the JobDetail reclaim UI to decide
+   * whether the escrow is still `Funded` and therefore reclaimable.
+   */
+  escrowStatus: EscrowStatus | null;
   createdAt: number;
   completedAt: number | null;
   deliverableHash: string | null;
