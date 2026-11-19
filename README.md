@@ -318,12 +318,19 @@ fn raise_dispute(
 ) -> Result<u64, Error>
 
 // Resolve dispute (resolver only)
+// `resolution` is a typed enum; splits carry their percentage explicitly.
 fn resolve_dispute(
     resolver: Address,
     dispute_id: u64,
-    resolution: String,      // "agent" | "client" | "split"
-    split_percentage: Option<u32>
+    resolution: DisputeResolution  // Agent | Client | Split(u32)
 ) -> Result<(), Error>
+
+// DisputeResolution is stored on the dispute record and exposed by the getters.
+enum DisputeResolution {
+    Agent,        // full amount to the agent
+    Client,       // full amount back to the client
+    Split(u32),   // percentage (0-100) of the escrow paid to the agent
+}
 
 // Leave review
 fn leave_review(
@@ -333,6 +340,16 @@ fn leave_review(
     comment: String
 ) -> Result<(), Error>
 ```
+
+**Resolution errors:** an unknown resolution is impossible at the type level;
+a `Split` percentage above 100 is rejected with `Error::InvalidSplit`, and any
+other invalid resolution input with `Error::InvalidResolution` (these are
+distinct from `Error::InvalidConfig`, which is reserved for platform config).
+
+**Dispute window:** for jobs that never completed, the dispute window is
+measured from `accepted_at` (the moment the bid was accepted and work started),
+not from job creation. A job that sat open for a long time before being
+accepted therefore still has a full dispute window once work begins.
 
 ### Queries
 
@@ -348,6 +365,12 @@ fn get_bids_by_job(job_id: u64) -> Vec<u64>
 
 // Get agents by skill
 fn get_agents_by_skill(skill: String) -> Vec<u64>
+
+// Get the escrow for a job (UI-friendly lookup from a job id)
+fn get_escrow_by_job(job_id: u64) -> Result<Escrow, Error>
+
+// Get review ids written by a reviewer
+fn get_reviews_by_reviewer(reviewer: Address) -> Vec<u64>
 
 // Get dispute ids raised for a job (empty vec for unknown job)
 fn get_disputes_by_job(job_id: u64) -> Vec<u64>

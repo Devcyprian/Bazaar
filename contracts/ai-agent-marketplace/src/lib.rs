@@ -50,6 +50,9 @@ pub struct Job {
     // via DataKey::BidsByJob(job_id).  Use get_bids_by_job() to fetch them.
     pub escrow_amount: i128,
     pub created_at: u64,
+    /// #112: ledger timestamp when a bid was accepted and work started.  Used
+    /// as the start of the dispute window for jobs that never completed.
+    pub accepted_at: Option<u64>,
     pub completed_at: Option<u64>,
     pub deliverable_hash: Option<BytesN<32>>,
     pub dispute_raised: bool,
@@ -170,7 +173,8 @@ pub struct Dispute {
     pub evidence_uri: String,
     pub status: DisputeStatus,
     pub resolver: Option<Address>,
-    pub resolution: Option<String>,
+    /// #110: typed resolution outcome (agent / client / split percentage).
+    pub resolution: Option<DisputeResolution>,
     pub created_at: u64,
     pub resolved_at: Option<u64>,
     /// #170: ledger timestamp after which either party may trigger the
@@ -185,6 +189,18 @@ pub enum DisputeStatus {
     UnderReview,
     Resolved,
     Escalated,
+}
+
+/// #110: Typed dispute resolution.  Replaces the free-form `String` argument
+/// previously accepted by `resolve_dispute`, making invalid resolutions
+/// impossible at the type level.  `Split` carries the mandatory percentage of
+/// the payout (after fees) that goes to the agent.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DisputeResolution {
+    Agent,
+    Client,
+    Split(u32),
 }
 
 #[contracttype]
@@ -248,6 +264,8 @@ pub enum DataKey {
     EscrowByJob(u64),
     Review(u64),
     ReviewsByReviewee(Address),
+    /// #109: reviews written by a given reviewer.
+    ReviewsByReviewer(Address),
     /// #123: (job_id, reviewer) -> review_id, for O(1) duplicate checks.
     ReviewByJobReviewer(u64, Address),
     /// #121: Aggregated client reputation.
@@ -348,6 +366,12 @@ pub enum Error {
     InputTooLong = 54,
     /// Returned by `place_bid` when the bidding agent has been deactivated.
     AgentInactive = 55,
+    /// #111: Returned by `resolve_dispute` when the requested resolution
+    /// cannot be honored for the dispute's current state.
+    InvalidResolution = 56,
+    /// #111: Returned by `resolve_dispute` when a split percentage is greater
+    /// than 100.
+    InvalidSplit = 57,
 }
 
 /// #172: Minimum TTL (in ledgers) we keep on persistent records.  At ~5s per
@@ -892,6 +916,7 @@ impl AiAgentMarketplace {
             assigned_agent: None,
             escrow_amount: 0,
             created_at: now,
+            accepted_at: None,
             completed_at: None,
             deliverable_hash: None,
             dispute_raised: false,
@@ -1218,6 +1243,9 @@ impl AiAgentMarketplace {
         job.status = JobStatus::InProgress;
         job.assigned_agent = Some(bid.agent.clone());
         job.escrow_amount = escrow_amount;
+        // #112: record when work started so the dispute window for jobs that
+        // never complete is measured from acceptance, not from posting.
+        job.accepted_at = Some(now);
         env.storage().instance().set(&DataKey::Job(job_id), &job);
 
         // Update bid status
@@ -1425,8 +1453,11 @@ impl AiAgentMarketplace {
             return Err(Error::AlreadyDisputed);
         }
 
-        // Check dispute window (measured from completion, falling back to creation)
-        let window_start = job.completed_at.unwrap_or(job.created_at);
+        // Check dispute window.  #112: measured from completion when the job
+        // completed, otherwise from bid acceptance (when work started), and
+        // only falling back to creation for jobs that were never accepted.
+        let window_start = job.completed_at
+            .unwrap_or_else(|| job.accepted_at.unwrap_or(job.created_at));
         let dispute_deadline = window_start + (config.dispute_window_days * 86400);
         if env.ledger().timestamp() > dispute_deadline {
             return Err(Error::DisputeWindowExpired);
@@ -1505,8 +1536,7 @@ impl AiAgentMarketplace {
         env: Env,
         resolver: Address,
         dispute_id: u64,
-        resolution: String, // "agent" | "client" | "split"
-        split_percentage: Option<u32>, // If split, percentage to agent
+        resolution: DisputeResolution,
     ) -> Result<(), Error> {
         resolver.require_auth();
         Self::extend_instance_ttl(&env);
@@ -1541,21 +1571,22 @@ impl AiAgentMarketplace {
         // All validation above; all state writes below; token transfers last.
 
         // ----- Effects: write all state before any external call -----
-        let (agent_payout, client_payout) = match resolution.as_str() {
-            "agent" => {
+        let (agent_payout, client_payout) = match resolution.clone() {
+            DisputeResolution::Agent => {
                 escrow.status = EscrowStatus::Released;
                 job.status = JobStatus::Completed;
                 (payout, 0)
             }
-            "client" => {
+            DisputeResolution::Client => {
                 escrow.status = EscrowStatus::Refunded;
                 job.status = JobStatus::Refunded;
                 (0, payout)
             }
-            "split" => {
-                let percentage = split_percentage.unwrap_or(50);
+            DisputeResolution::Split(percentage) => {
+                // #111: the percentage is mandatory (carried by the enum) and
+                // validated with a dedicated error.
                 if percentage > 100 {
-                    return Err(Error::InvalidConfig);
+                    return Err(Error::InvalidSplit);
                 }
                 let agent_amount = (payout * percentage as i128) / 100;
                 let client_amount = payout - agent_amount;
@@ -1563,7 +1594,6 @@ impl AiAgentMarketplace {
                 job.status = JobStatus::Completed;
                 (agent_amount, client_amount)
             }
-            _ => return Err(Error::InvalidConfig),
         };
 
         escrow.resolver = Some(resolver.clone());
@@ -1577,7 +1607,7 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::Config, &updated_config);
 
         dispute.status = DisputeStatus::Resolved;
-        dispute.resolution = Some(resolution);
+        dispute.resolution = Some(resolution.clone());
         dispute.resolved_at = Some(env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Dispute(dispute_id), &dispute);
 
@@ -1671,6 +1701,13 @@ impl AiAgentMarketplace {
             .unwrap_or(Vec::new(&env));
         reviewee_reviews.push_back(review_id);
         env.storage().instance().set(&DataKey::ReviewsByReviewee(reviewee.clone()), &reviewee_reviews);
+
+        // #109: index review by its author so a user can list reviews they wrote.
+        let mut reviewer_reviews: Vec<u64> = env.storage().instance()
+            .get(&DataKey::ReviewsByReviewer(reviewer.clone()))
+            .unwrap_or(Vec::new(&env));
+        reviewer_reviews.push_back(review_id);
+        env.storage().instance().set(&DataKey::ReviewsByReviewer(reviewer.clone()), &reviewer_reviews);
 
         // #121: when the agent reviews the client, update the client's stats.
         if job.client != reviewer {
@@ -1973,7 +2010,7 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
 
         dispute.status = DisputeStatus::Resolved;
-        dispute.resolution = Some(String::from_str(&env, "fallback_split"));
+        dispute.resolution = Some(DisputeResolution::Split(DISPUTE_FALLBACK_AGENT_PCT));
         dispute.resolved_at = Some(env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Dispute(dispute_id), &dispute);
 
@@ -2181,6 +2218,22 @@ impl AiAgentMarketplace {
         Self::paginate(&env, &all, offset, limit)
     }
 
+    /// #109: Get reviews written by a reviewer (paginated).
+    ///
+    /// Returns a slice of review IDs authored by `reviewer` starting at
+    /// `offset` with at most `limit` entries.
+    pub fn get_reviews_by_reviewer(
+        env: Env,
+        reviewer: Address,
+        offset: u64,
+        limit: u64,
+    ) -> Vec<u64> {
+        let all: Vec<u64> = env.storage().instance()
+            .get(&DataKey::ReviewsByReviewer(reviewer))
+            .unwrap_or(Vec::new(&env));
+        Self::paginate(&env, &all, offset, limit)
+    }
+
     /// Get reviews for an agent/user (paginated).
     ///
     /// Returns a slice of review IDs for the reviewee starting at `offset`
@@ -2281,14 +2334,15 @@ impl AiAgentMarketplace {
         agent_id.and_then(|id| Self::get_agent(&env, id).ok())
     }
 
-    /// Get the escrow funding a job, if any.
+    /// Get the escrow funding a job.
     ///
-    /// Returns `Some(Escrow)` when a bid has been accepted and escrow funded
-    /// for the job, otherwise `None`.
-    pub fn get_escrow_by_job(env: Env, job_id: u64) -> Option<Escrow> {
-        let escrow_id: Option<u64> = env.storage().instance()
-            .get(&DataKey::EscrowByJob(job_id));
-        escrow_id.and_then(|id| Self::get_escrow(&env, id).ok())
+    /// Returns `Err(Error::EscrowNotFound)` when no bid has been accepted for
+    /// the job yet (or the escrow record is missing).
+    pub fn get_escrow_by_job(env: Env, job_id: u64) -> Result<Escrow, Error> {
+        let escrow_id: u64 = env.storage().instance()
+            .get(&DataKey::EscrowByJob(job_id))
+            .ok_or(Error::EscrowNotFound)?;
+        Self::get_escrow(&env, escrow_id)
     }
 
     /// #121: Get aggregated reputation stats for a client.
