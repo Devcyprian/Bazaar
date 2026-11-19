@@ -85,6 +85,7 @@ fn budget_per_entrypoint_within_mainnet_limits() {
             &30,          // escrow_expiry_days
             &Vec::new(&env),
             &false,
+            &50,          // max_bids_per_job
         )
     });
 
@@ -117,6 +118,34 @@ fn budget_per_entrypoint_within_mainnet_limits() {
         market.place_bid(&agent, &job_id, &budget, &5, &String::from_str(&env, "proposal"))
     });
     measure(&env, "accept_bid", || market.accept_bid(&client, &job_id, &bid_id));
+
+    // #129: accept_bid must stay bounded even when the job is at the bid cap,
+    // since it marks every other bid Rejected.
+    let max_bids: u32 = 50;
+    let capped_job_id = market.post_job(
+        &client,
+        &String::from_str(&env, "Capped"),
+        &String::from_str(&env, "Job at the bid cap"),
+        &skills(&env),
+        &budget,
+        &7,
+    );
+    let mut capped_bid_id = 0u64;
+    for _ in 0..max_bids {
+        let bidder = Address::generate(&env);
+        let id = market.place_bid(
+            &bidder,
+            &capped_job_id,
+            &budget,
+            &5,
+            &String::from_str(&env, "p"),
+        );
+        capped_bid_id = id;
+    }
+    measure(&env, "accept_bid (max bids)", || {
+        market.accept_bid(&client, &capped_job_id, &capped_bid_id)
+    });
+
     measure(&env, "submit_deliverable", || {
         market.submit_deliverable(&agent, &job_id, &deliverable)
     });

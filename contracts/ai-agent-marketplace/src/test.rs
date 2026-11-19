@@ -14,10 +14,54 @@ Let me write the complete file:
 
 use super::*;
 use soroban_sdk::{
+    contract, contractimpl,
     testutils::{Address as _, Ledger},
     Address, BytesN, Env, IntoVal, String, Vec, Map, symbol_short,
     token::{Client as TokenClient, StellarAssetClient as TokenAdminClient},
 };
+
+// ==================== Mock Tokens ====================
+
+/// A mock token whose `transfer` always panics. Used to verify that the
+/// marketplace performs checks-effects-interactions ordering and leaves no
+/// partial state behind when an external token call fails (#131).
+#[contract]
+pub struct FailingToken;
+
+#[contractimpl]
+impl FailingToken {
+    pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {
+        panic!("FailingToken: transfer always fails");
+    }
+    pub fn transfer_from(_env: Env, _spender: Address, _from: Address, _to: Address, _amount: i128) {
+        panic!("FailingToken: transfer_from always fails");
+    }
+    pub fn balance(_env: Env, _id: Address) -> i128 {
+        0
+    }
+    pub fn approve(_env: Env, _from: Address, _spender: Address, _amount: i128, _expiration_ledger: u32) {}
+    pub fn allowance(_env: Env, _from: Address, _spender: Address) -> i128 { 0 }
+    pub fn decimals(_env: Env) -> u32 { 7 }
+    pub fn name(env: Env) -> String { String::from_str(&env, "FailingToken") }
+    pub fn symbol(env: Env) -> String { String::from_str(&env, "FAIL") }
+}
+
+/// A mock token that reports a non-7 `decimals()` value. Used to verify that
+/// `initialize` rejects tokens that are not 7-decimal SACs (#132).
+#[contract]
+pub struct WrongDecimalsToken;
+
+#[contractimpl]
+impl WrongDecimalsToken {
+    pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {}
+    pub fn transfer_from(_env: Env, _spender: Address, _from: Address, _to: Address, _amount: i128) {}
+    pub fn balance(_env: Env, _id: Address) -> i128 { 0 }
+    pub fn approve(_env: Env, _from: Address, _spender: Address, _amount: i128, _expiration_ledger: u32) {}
+    pub fn allowance(_env: Env, _from: Address, _spender: Address) -> i128 { 0 }
+    pub fn decimals(_env: Env) -> u32 { 6 }
+    pub fn name(env: Env) -> String { String::from_str(&env, "WrongDecimalsToken") }
+    pub fn symbol(env: Env) -> String { String::from_str(&env, "WRONG") }
+}
 
 fn create_token_contract(e: &Env) -> TokenClient {
     let admin = Address::generate(e);
@@ -49,6 +93,7 @@ fn create_marketplace_contract<'a>(
         &false,         // require_skill_verification (off by default)
         &1_000_000_000, // max_job_budget (1000 USDC)
         &10_000_000_000, // max_total_escrow (10000 USDC)
+        &50,            // max_bids_per_job (#129)
     );
 
     client
@@ -759,6 +804,9 @@ fn test_skill_verification() {
         &30,
         &Vec::from_array(&e, [verifier.clone()]),
         &false, // require_skill_verification
+        &1_000_000_000,  // max_job_budget
+        &10_000_000_000, // max_total_escrow
+        &50,             // max_bids_per_job
     );
 
     // Register agent
@@ -2714,6 +2762,9 @@ fn create_marketplace_with_verification_flag<'a>(
         &30,
         &Vec::from_array(e, [verifier.clone()]),
         &require_skill_verification,
+        &1_000_000_000,  // max_job_budget
+        &10_000_000_000, // max_total_escrow
+        &50,             // max_bids_per_job
     );
 
     client
@@ -2756,6 +2807,241 @@ fn test_bid_allowed_when_verification_not_required() {
         &100_000_000,
         &14,
     );
+
+    // ==================== #129: Bid cap per job ====================
+
+    /// Placing exactly `max_bids_per_job` bids succeeds; the next one is rejected.
+    #[test]
+    fn test_place_bid_rejected_over_max_bids_per_job() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let admin = Address::generate(&e);
+        let client_addr = Address::generate(&e);
+        let usdc = create_token_contract(&e);
+        let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+        let job_id = marketplace.post_job(
+            &client_addr,
+            &String::from_str(&e, "Job"),
+            &String::from_str(&e, "Desc"),
+            &Vec::new(&e),
+            &10_000_000,
+            &14,
+        );
+
+        // The helper configures max_bids_per_job = 50.
+        for _ in 0..50 {
+            let owner = Address::generate(&e);
+            marketplace.register_agent(
+                &owner,
+                &String::from_str(&e, "Agent"),
+                &String::from_str(&e, "Desc"),
+                &Vec::new(&e),
+                &10_000_000,
+                &String::from_str(&e, "ipfs://test"),
+            );
+            marketplace.place_bid(
+                &owner,
+                &job_id,
+                &10_000_000,
+                &1,
+                &String::from_str(&e, "Proposal"),
+            );
+        }
+
+        // The 51st bid must be rejected.
+        let extra_owner = Address::generate(&e);
+        marketplace.register_agent(
+            &extra_owner,
+            &String::from_str(&e, "Agent"),
+            &String::from_str(&e, "Desc"),
+            &Vec::new(&e),
+            &10_000_000,
+            &String::from_str(&e, "ipfs://test"),
+        );
+        let result = marketplace.try_place_bid(
+            &extra_owner,
+            &job_id,
+            &10_000_000,
+            &1,
+            &String::from_str(&e, "Proposal"),
+        );
+        assert_eq!(result, Err(Ok(Error::TooManyBids)));
+
+        // Exactly 50 bids were recorded.
+        assert_eq!(marketplace.get_bids_by_job(&job_id, &0, &100).len(), 50);
+    }
+
+    // ==================== #130: Direct fee transfer ====================
+
+    /// `accept_bid` must debit the client `bid + fee`, hold `bid` in the
+    /// contract, and pay `fee` directly to the platform recipient.
+    #[test]
+    fn test_accept_bid_final_balances_and_direct_fee_transfer() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let admin = Address::generate(&e);
+        let client_addr = Address::generate(&e);
+        let agent_owner = Address::generate(&e);
+        let usdc = create_token_contract(&e);
+        let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+        let usdc_client = TokenClient::new(&e, &usdc.address());
+
+        let admin_client = TokenAdminClient::new(&e, &usdc.address());
+        admin_client.mint(&client_addr, &100_000_000);
+
+        marketplace.register_agent(
+            &agent_owner,
+            &String::from_str(&e, "Agent"),
+            &String::from_str(&e, "Desc"),
+            &Vec::from_array(&e, [String::from_str(&e, "python")]),
+            &50_000_000,
+            &String::from_str(&e, "ipfs://QmTest"),
+        );
+
+        let job_id = marketplace.post_job(
+            &client_addr,
+            &String::from_str(&e, "Job"),
+            &String::from_str(&e, "Desc"),
+            &Vec::from_array(&e, [String::from_str(&e, "python")]),
+            &100_000_000,
+            &14,
+        );
+
+        let bid_id = marketplace.place_bid(
+            &agent_owner,
+            &job_id,
+            &80_000_000,
+            &7,
+            &String::from_str(&e, "Proposal"),
+        );
+
+        marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+        // 1% fee on an 80 USDC bid = 0.8 USDC.
+        let fee = 800_000i128;
+        let contract_addr = marketplace.address.clone();
+
+        // Client debited bid + fee.
+        assert_eq!(usdc_client.balance(&client_addr), 100_000_000 - 80_000_000 - fee);
+        // Contract holds the bid amount.
+        assert_eq!(usdc_client.balance(&contract_addr), 80_000_000);
+        // Platform recipient received the fee directly.
+        assert_eq!(usdc_client.balance(&admin), fee);
+        // Agent has not been paid yet.
+        assert_eq!(usdc_client.balance(&agent_owner), 0);
+
+        // The escrow records the bid amount only.
+        let escrow = marketplace.get_escrow_by_job(&job_id).unwrap();
+        assert_eq!(escrow.amount, 80_000_000);
+    }
+
+    // ==================== #131: Checks-effects-interactions ====================
+
+    /// A token whose `transfer` panics must leave no partial state behind:
+    /// the job stays Open, no escrow is created, and the bid stays Pending.
+    #[test]
+    fn test_failing_token_accept_bid_leaves_no_partial_state() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let admin = Address::generate(&e);
+        let client_addr = Address::generate(&e);
+        let agent_owner = Address::generate(&e);
+
+        let failing_token_id = e.register_contract(None, FailingToken);
+        let marketplace = create_marketplace_contract(&e, &admin, &failing_token_id);
+
+        marketplace.register_agent(
+            &agent_owner,
+            &String::from_str(&e, "Agent"),
+            &String::from_str(&e, "Desc"),
+            &Vec::from_array(&e, [String::from_str(&e, "python")]),
+            &50_000_000,
+            &String::from_str(&e, "ipfs://QmTest"),
+        );
+
+        let job_id = marketplace.post_job(
+            &client_addr,
+            &String::from_str(&e, "Job"),
+            &String::from_str(&e, "Desc"),
+            &Vec::from_array(&e, [String::from_str(&e, "python")]),
+            &100_000_000,
+            &14,
+        );
+
+        let bid_id = marketplace.place_bid(
+            &agent_owner,
+            &job_id,
+            &80_000_000,
+            &7,
+            &String::from_str(&e, "Proposal"),
+        );
+
+        // The token transfer panics -> accept_bid must fail.
+        let result = marketplace.try_accept_bid(&client_addr, &job_id, &bid_id);
+        assert!(result.is_err());
+
+        // No partial state: job still Open, no escrow, bid still Pending.
+        let job = marketplace.get_job(&job_id);
+        assert_eq!(job.status, JobStatus::Open);
+        assert!(marketplace.get_escrow_by_job(&job_id).is_none());
+
+        let bid = marketplace.get_bid(&bid_id);
+        assert_eq!(bid.status, BidStatus::Pending);
+    }
+
+    // ==================== #132: Token decimals validation ====================
+
+    /// A token reporting `decimals() != 7` must be rejected at initialize.
+    #[test]
+    fn test_initialize_rejects_wrong_decimals_token() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let admin = Address::generate(&e);
+        let wrong_token_id = e.register_contract(None, WrongDecimalsToken);
+
+        let contract_id = e.register_contract(None, AiAgentMarketplace);
+        let client = AiAgentMarketplaceClient::new(&e, &contract_id);
+
+        let result = client.try_initialize(
+            &admin,
+            &wrong_token_id,
+            &100,
+            &10_000_000,
+            &30,
+            &7,
+            &0,
+            &admin,
+            &admin,
+            &0,
+            &200,
+            &30,
+            &Vec::new(&e),
+            &false,
+            &1_000_000_000,
+            &10_000_000_000,
+            &50,
+        );
+        assert_eq!(result, Err(Ok(Error::InvalidToken)));
+    }
+
+    /// A 7-decimal token (the standard SAC) is accepted at initialize.
+    #[test]
+    fn test_initialize_accepts_seven_decimal_token() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let admin = Address::generate(&e);
+        let usdc = create_token_contract(&e);
+
+        // The helper already asserts success by not panicking.
+        let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+        assert_eq!(marketplace.get_platform_stats().total_jobs, 0);
+    }
 
 For `resolve_dispute` while paused - need to set up dispute, then pause, then resolve.
 
