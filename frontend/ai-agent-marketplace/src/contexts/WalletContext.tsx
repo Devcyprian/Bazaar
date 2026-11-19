@@ -56,6 +56,34 @@ export const getComplianceLists = () => ({
   blockedRegions: [...BLOCKED_REGIONS],
 });
 
+// ---------------------------------------------------------------------------
+// Terms of Service / Privacy Policy acceptance
+// ---------------------------------------------------------------------------
+// Bump TERMS_VERSION whenever the terms change so users are asked to accept
+// them again on their next wallet connect. Acceptance is recorded per address
+// in localStorage under `terms-accepted:<publicKey>`.
+// ---------------------------------------------------------------------------
+
+export const TERMS_VERSION = '2026-11-19';
+
+const termsKey = (publicKey: string) => `terms-accepted:${publicKey}`;
+
+const hasAcceptedTerms = (publicKey: string): boolean => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(termsKey(publicKey)) ?? 'null');
+    return saved?.version === TERMS_VERSION;
+  } catch {
+    return false;
+  }
+};
+
+const recordTermsAcceptance = (publicKey: string) => {
+  localStorage.setItem(
+    termsKey(publicKey),
+    JSON.stringify({ version: TERMS_VERSION, acceptedAt: new Date().toISOString() }),
+  );
+};
+
 interface Balances {
   /** Native XLM balance as a decimal string, e.g. "9.9999900" */
   xlmBalance: string;
@@ -183,6 +211,19 @@ export const WalletProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setState((prev) => ({ ...prev, isConnecting: true }));
     try {
       const publicKey = await freighter.getPublicKey();
+      if (!hasAcceptedTerms(publicKey)) {
+        const accepted = window.confirm(
+          'By connecting your wallet you agree to the AgentMarket Terms of Service ' +
+          '(including the fee schedule) and Privacy Policy, available at /terms and /privacy.\n\n' +
+          'Platform fee: 1% of the accepted bid. Dispute fee: 2% of escrow. ' +
+          'Stellar network fees apply to every transaction.\n\nDo you accept?',
+        );
+        if (!accepted) {
+          setState((prev) => ({ ...prev, isConnecting: false }));
+          return;
+        }
+        recordTermsAcceptance(publicKey);
+      }
       const { xlmBalance, usdcBalance } = await fetchBalances(publicKey, state.network);
       const blocked = isAddressBlocked(publicKey);
       setState((prev) => ({

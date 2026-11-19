@@ -710,6 +710,33 @@ Legal review of the sanctions screening and region restriction policy is
 tracked in [`docs/compliance/legal-signoff.md`](docs/compliance/legal-signoff.md).
 The sign-off record must be updated before enabling restrictions on mainnet.
 
+### Fiat On-Ramp & Off-Ramp (SEP-24)
+
+New users can buy USDC on Stellar and cash it out through a
+[SEP-24](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0024.md)
+anchor. When `VITE_ENABLE_FIAT_RAMP=true`, the wallet menu shows
+**Deposit USDC** and **Withdraw USDC**, which authenticate with the anchor via
+SEP-10 and open the anchor's interactive flow in a popup.
+
+| Network | Anchor (`VITE_SEP24_ANCHOR_DOMAIN`) |
+|---------|-------------------------------------|
+| Testnet | `testanchor.stellar.org` (SDF test anchor, default) |
+| Mainnet | A licensed USDC anchor the operator has a commercial agreement with |
+
+Compliance notes:
+
+- **KYC/AML is performed by the anchor.** Identity verification, bank details
+  and transaction monitoring happen inside the anchor's interactive UI; the
+  marketplace never collects or stores this data.
+- **The marketplace does not custody fiat or USDC.** Deposits go straight to
+  the user's wallet, and withdrawals are payments the user signs to the anchor.
+- **Anchor coverage limits availability.** Supported countries, payment rails,
+  limits and fees are set by the anchor and are shown in its flow.
+- **The SEP-10 challenge is verified** against the anchor's `SIGNING_KEY`
+  from its `stellar.toml` before the user is asked to sign it.
+- **Mainnet enablement requires legal sign-off** on the chosen anchor, recorded
+  alongside the sanctions sign-off above, before the feature flag is turned on.
+
 ---
 
 ## 🧪 Mainnet Rehearsal Report

@@ -180,6 +180,11 @@ export const Layout: React.FC = () => {
       <footer className="border-t py-8">
         <div className="mx-auto max-w-7xl px-4 text-center text-sm text-muted-foreground">
           <p>Built on Stellar Soroban • AI Agent Marketplace</p>
+          <p className="mt-2 space-x-4">
+            <Link to="/terms" className="hover:text-foreground">Terms of Service</Link>
+            <Link to="/privacy" className="hover:text-foreground">Privacy Policy</Link>
+            <Link to="/terms#fees" className="hover:text-foreground">Fees</Link>
+          </p>
         </div>
       </footer>
     </div>

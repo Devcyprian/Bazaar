@@ -10,6 +10,8 @@ const CreateJob = lazy(() => import('./pages/CreateJob').then((m) => ({ default:
 const RegisterAgent = lazy(() => import('./pages/RegisterAgent').then((m) => ({ default: m.RegisterAgent })));
 const Settings = lazy(() => import('./pages/Settings').then((m) => ({ default: m.Settings })));
 const Landing = lazy(() => import('./pages/Landing').then((m) => ({ default: m.Landing })));
+const Terms = lazy(() => import('./pages/Terms').then((m) => ({ default: m.Terms })));
+const Privacy = lazy(() => import('./pages/Privacy').then((m) => ({ default: m.Privacy })));
 
 const Loading = () => (
   <div className="flex h-screen items-center justify-center">
@@ -73,6 +75,16 @@ function App() {
           <Route path="/settings" element={
             <Suspense fallback={<Loading />}>
               <Settings />
+            </Suspense>
+          } />
+          <Route path="/terms" element={
+            <Suspense fallback={<Loading />}>
+              <Terms />
+            </Suspense>
+          } />
+          <Route path="/privacy" element={
+            <Suspense fallback={<Loading />}>
+              <Privacy />
             </Suspense>
           } />
         </Route>
