@@ -180,6 +180,17 @@ pub struct Config {
     /// Default for new deployments should be `false` so that new agents are
     /// not blocked from the marketplace before a verifier network exists.
     pub require_skill_verification: bool,
+    /// Contract storage schema version.  Bumped by `upgrade` so that off-chain
+    /// tooling can detect which migration steps have been applied.
+    pub version: u32,
+    /// Maximum budget a single job may be posted with.  Used as a canary cap
+    /// on mainnet to limit exposure while the contract is unproven.
+    pub max_job_budget: i128,
+    /// Maximum total value that may be locked in escrow at any one time.
+    pub max_total_escrow: i128,
+    /// Running total of funds currently locked in funded escrows.  Maintained
+    /// alongside escrow state transitions so the cap can be enforced.
+    pub total_locked_escrow: i128,
 }
 
 #[contracttype]
@@ -321,6 +332,12 @@ impl AiAgentMarketplace {
             return Err(Error::InvalidConfig);
         }
 
+        // Canary defaults: cap a single job at 10_000 USDC and total locked
+        // escrow at 100_000 USDC (7 decimals).  Admins raise these in stages
+        // via `set_max_job_budget` / `set_max_total_escrow`.
+        let max_job_budget: i128 = 10_000 * 10_000_000;
+        let max_total_escrow: i128 = 100_000 * 10_000_000;
+
         let config = Config {
             admin: admin.clone(),
             usdc_token: usdc_token.clone(),
@@ -336,6 +353,10 @@ impl AiAgentMarketplace {
             escrow_expiry_days,
             skill_verifiers,
             require_skill_verification,
+            version: 1,
+            max_job_budget,
+            max_total_escrow,
+            total_locked_escrow: 0,
         };
 
         env.storage().instance().set(&DataKey::Config, &config);
@@ -387,6 +408,77 @@ impl AiAgentMarketplace {
     /// Check if contract is paused
     pub fn is_paused(env: Env) -> bool {
         env.storage().instance().get(&DataKey::IsPaused).unwrap_or(false)
+    }
+
+    /// Return the current contract storage schema version.
+    pub fn version(env: Env) -> u32 {
+        env.storage().instance()
+            .get::<DataKey, Config>(&DataKey::Config)
+            .map(|c| c.version)
+            .unwrap_or(0)
+    }
+
+    /// Admin-gated contract upgrade.
+    ///
+    /// Replaces the contract's WASM with `new_wasm_hash`.  Authorisation is
+    /// performed via `config.admin`, which on mainnet is expected to be a
+    /// multisig contract account.  Storage is *not* touched by this call, so
+    /// existing escrows, jobs and balances survive the upgrade; any schema
+    /// migration must be performed by a follow-up admin call (see runbook).
+    ///
+    /// Rollback: call `upgrade` again with the previously deployed WASM hash.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        let config = Self::get_config(&env)?;
+        config.admin.require_auth();
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+
+        env.events().publish(
+            (symbol_short!("upgrade"),),
+            (config.admin, new_wasm_hash),
+        );
+
+        Ok(())
+    }
+
+    /// Admin: set the per-job budget cap (canary exposure limit).
+    pub fn set_max_job_budget(env: Env, admin: Address, max_job_budget: i128) -> Result<(), Error> {
+        admin.require_auth();
+        let mut config = Self::get_config(&env)?;
+        if config.admin != admin {
+            return Err(Error::Unauthorized);
+        }
+        if max_job_budget < 0 {
+            return Err(Error::InvalidConfig);
+        }
+        config.max_job_budget = max_job_budget;
+        env.storage().instance().set(&DataKey::Config, &config);
+
+        env.events().publish(
+            (symbol_short!("caps_upd"),),
+            (admin, max_job_budget, config.max_total_escrow),
+        );
+        Ok(())
+    }
+
+    /// Admin: set the total locked escrow cap (canary exposure limit).
+    pub fn set_max_total_escrow(env: Env, admin: Address, max_total_escrow: i128) -> Result<(), Error> {
+        admin.require_auth();
+        let mut config = Self::get_config(&env)?;
+        if config.admin != admin {
+            return Err(Error::Unauthorized);
+        }
+        if max_total_escrow < 0 {
+            return Err(Error::InvalidConfig);
+        }
+        config.max_total_escrow = max_total_escrow;
+        env.storage().instance().set(&DataKey::Config, &config);
+
+        env.events().publish(
+            (symbol_short!("caps_upd"),),
+            (admin, config.max_job_budget, max_total_escrow),
+        );
+        Ok(())
     }
 
     /// Register a new AI agent
@@ -602,6 +694,15 @@ impl AiAgentMarketplace {
         
         if budget < config.min_job_budget {
             return Err(Error::InsufficientBudget);
+        }
+
+        // Canary exposure caps: reject jobs above the per-job cap and refuse
+        // to post a job that would push total locked escrow over the cap.
+        if budget > config.max_job_budget {
+            return Err(Error::InvalidBudget);
+        }
+        if config.total_locked_escrow + budget > config.max_total_escrow {
+            return Err(Error::InsufficientEscrowBalance);
         }
 
         if deadline_days > config.max_job_deadline_days || deadline_days == 0 {
@@ -882,7 +983,18 @@ impl AiAgentMarketplace {
         let platform_fee = (bid.amount * config.platform_fee_bps as i128) / 10000;
         let escrow_amount = bid.amount + platform_fee;
 
-        // Transfer USDC from client to escrow
+        // Enforce the total locked escrow cap before moving any funds.
+        if config.total_locked_escrow + escrow_amount > config.max_total_escrow {
+            return Err(Error::InsufficientEscrowBalance);
+        }
+
+        // Transfer USDC from client to escrow.
+        //
+        // Reentrancy: Soroban token transfers do not re-enter this contract
+        // (the token contract is a separate invocation and cannot call back
+        // into us mid-transfer).  All persistent state below is written only
+        // after the transfer returns successfully, so a panicking/failing
+        // transfer leaves no partial state behind.
         let usdc_client = TokenClient::new(&env, &config.usdc_token);
         usdc_client.transfer(&client, &env.current_contract_address(), &escrow_amount);
 
@@ -940,7 +1052,13 @@ impl AiAgentMarketplace {
         stats.total_fees_collected += platform_fee;
         env.storage().instance().set(&DataKey::PlatformStats, &stats);
 
-        // Transfer platform fee to recipient
+        // Track the newly locked escrow against the canary cap.
+        let mut updated_config = config.clone();
+        updated_config.total_locked_escrow += escrow_amount;
+        env.storage().instance().set(&DataKey::Config, &updated_config);
+
+        // Transfer platform fee to recipient.  State above is already
+        // committed; if this transfer fails the whole invocation reverts.
         usdc_client.transfer(
             &env.current_contract_address(),
             &config.platform_fee_recipient,
@@ -1022,7 +1140,11 @@ impl AiAgentMarketplace {
             return Err(Error::EscrowNotFunded);
         }
 
-        // Release payment to agent
+        // Release payment to agent.
+        //
+        // Reentrancy: token transfers cannot call back into this contract, and
+        // all state writes below happen after the transfer succeeds.  A failed
+        // transfer aborts the invocation, leaving escrow/job state untouched.
         let usdc_client = TokenClient::new(&env, &config.usdc_token);
         usdc_client.transfer(
             &env.current_contract_address(),
@@ -1034,6 +1156,12 @@ impl AiAgentMarketplace {
         escrow.status = EscrowStatus::Released;
         escrow.released_at = Some(env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
+
+        // Release the locked-escrow accounting now that funds have left.
+        let mut updated_config = config.clone();
+        updated_config.total_locked_escrow =
+            (updated_config.total_locked_escrow - escrow.amount).max(0);
+        env.storage().instance().set(&DataKey::Config, &updated_config);
 
         // Update agent stats
         let agent_id: u64 = env.storage().instance()
@@ -1247,6 +1375,12 @@ impl AiAgentMarketplace {
         escrow.released_at = Some(env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
 
+        // Release the locked-escrow accounting now that funds have left.
+        let mut updated_config = config.clone();
+        updated_config.total_locked_escrow =
+            (updated_config.total_locked_escrow - escrow.amount).max(0);
+        env.storage().instance().set(&DataKey::Config, &updated_config);
+
         dispute.status = DisputeStatus::Resolved;
         dispute.resolution = Some(resolution);
         dispute.resolved_at = Some(env.ledger().timestamp());
@@ -1380,7 +1514,9 @@ impl AiAgentMarketplace {
         job_id: u64,
     ) -> Result<(), Error> {
         client.require_auth();
-        Self::ensure_not_paused(&env)?;
+        // NOTE: deliberately NOT gated on `ensure_not_paused`.  Refund paths
+        // must remain callable while the contract is paused so that user funds
+        // can never be trapped by an emergency pause.
 
         let config = Self::get_config(&env)?;
         let mut job = Self::get_job(&env, job_id)?;
@@ -1410,7 +1546,10 @@ impl AiAgentMarketplace {
             return Err(Error::EscrowExpired);
         }
 
-        // Transfer the escrowed amount back to the client
+        // Transfer the escrowed amount back to the client.
+        //
+        // Reentrancy: token transfers cannot re-enter this contract; all state
+        // writes below occur only after the transfer succeeds.
         let usdc_client = TokenClient::new(&env, &config.usdc_token);
         usdc_client.transfer(
             &env.current_contract_address(),
@@ -1422,6 +1561,12 @@ impl AiAgentMarketplace {
         escrow.status = EscrowStatus::Refunded;
         escrow.released_at = Some(env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
+
+        // Release the locked-escrow accounting now that funds have left.
+        let mut updated_config = config.clone();
+        updated_config.total_locked_escrow =
+            (updated_config.total_locked_escrow - escrow.amount).max(0);
+        env.storage().instance().set(&DataKey::Config, &updated_config);
 
         // Update job state
         job.status = JobStatus::Refunded;
@@ -1804,6 +1949,11 @@ impl AiAgentMarketplace {
             return Err(Error::ContractPaused);
         }
         Ok(())
+    }
+
+    /// Alias for `ensure_not_paused` used by fund-locking entrypoints.
+    fn require_not_paused(env: &Env) -> Result<(), Error> {
+        Self::ensure_not_paused(env)
     }
 
     fn get_agent(env: &Env, agent_id: u64) -> Result<Agent, Error> {

@@ -72,6 +72,8 @@ stellar contract invoke \
   --min_agent_reputation_to_bid 0 \
   --platform_fee_bps_dispute 200 \
   --escrow_expiry_days 30 \
+  --max_job_budget 10000000000 \
+  --max_total_escrow 100000000000 \
   --skill_verifiers '[]'
 
 echo -e "${GREEN}✅ Contract initialized successfully!${NC}"
@@ -85,3 +87,5 @@ echo "  Max Deadline: 30 days"
 echo "  Dispute Window: 7 days"
 echo "  Dispute Fee: 2% (200 bps)"
 echo "  Escrow Expiry: 30 days"
+echo "  Max Job Budget: 1000 USDC (canary cap)"
+echo "  Max Total Escrow: 10000 USDC (canary cap)"

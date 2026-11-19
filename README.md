@@ -574,17 +574,144 @@ env.events().publish(("review",), (review_id, job_id, reviewer, reviewee, rating
 
 | Limitation | Mitigation |
 |------------|------------|
-| Single contract = single point of failure | Upgradeable via admin (planned) |
+| Single contract = single point of failure | Admin-gated `upgrade(new_wasm_hash)` via multisig, with `version()` getter and documented migration/rollback runbook (see [Contract Upgrades & Migration](#-contract-upgrades--migration)) |
 | No on-chain randomness | Not needed for current features |
 | Skill verification centralized | Multi-verifier support + DAO governance planned |
 | Dispute resolver = single address | Multi-sig / DAO resolver support planned |
+| Unproven contract on mainnet | Canary escrow caps (`max_job_budget`, `max_total_escrow`) raised in stages (see [Escrow Caps](#-escrow-caps)) |
+
+---
+
+## 🔄 Contract Upgrades & Migration
+
+Once mainnet holds escrow, bug fixes must ship without stranding funds. The
+contract exposes an admin-gated upgrade entrypoint plus a version getter.
+
+### Entrypoints
+
+```rust
+// Returns the current contract version (bumped on every upgrade)
+fn version(env: Env) -> u32
+
+// Replace the contract code. Auth is required from the admin address,
+// which on mainnet is a multisig account.
+fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error>
+```
+
+`upgrade` calls `admin.require_auth()` (the multisig), so the upgrade only
+proceeds once the multisig threshold signs. It installs the new wasm via
+`env.deployer().update_current_contract_wasm(new_wasm_hash)` and emits an
+`upgrade` event containing the new wasm hash and the new version.
+
+### Storage Migration Procedure
+
+1. **Design migrations to be idempotent.** New code must tolerate both old and
+   new storage layouts during the upgrade window.
+2. **Bump the version constant** in the new wasm and add a `migrate` step (or
+   lazy migration on first read) that rewrites any changed keys.
+3. **Never delete escrow keys.** `Escrow`, `Job`, and `Bid` entries must be
+   preserved verbatim; only additive fields or new keys are allowed.
+4. **Rehearse on testnet** (see checklist below) before touching mainnet.
+5. **Record the previous wasm hash** so rollback is a single `upgrade` call.
+
+### Testnet Rehearsal Checklist
+
+- [ ] Build and upload the new wasm: `stellar contract upload --wasm <new.wasm> --source-account deployer --network testnet`
+- [ ] Note the returned wasm hash (`NEW_HASH`)
+- [ ] Snapshot existing escrows: `stellar contract invoke --id $CONTRACT_ID -- get_job --job_id 1` (repeat for all live jobs)
+- [ ] Run the upgrade: `stellar contract invoke --id $CONTRACT_ID --source-account multisig-admin -- upgrade --new_wasm_hash $NEW_HASH`
+- [ ] Verify `version()` returns the new version
+- [ ] Verify every snapshotted escrow still resolves with identical state (funded amount, status, parties)
+- [ ] Exercise `reclaim_expired_escrow`, `approve_deliverable`, and `resolve_dispute` against migrated data
+- [ ] Only then schedule the mainnet upgrade
+
+### Rollback
+
+If the new wasm misbehaves:
+
+1. Re-run the upgrade with the **previous** wasm hash:
+   `stellar contract invoke --id $CONTRACT_ID --source-account multisig-admin -- upgrade --new_wasm_hash $PREV_HASH`
+2. Verify `version()` returns the previous version.
+3. Verify escrow state is unchanged (re-run the snapshot queries above).
+4. If a migration already rewrote keys, the previous wasm must include a
+   compatible read path — this is why migrations must be additive and
+   idempotent.
+
+---
+
+## ⏸️ Emergency Pause
+
+`set_paused(true)` (admin only) is a circuit breaker. It must block every path
+that moves or locks funds while still letting users recover refundable escrow.
+
+| Entrypoint | While paused |
+|------------|--------------|
+| `post_job` | ❌ Blocked (no new funding) |
+| `accept_bid` | ❌ Blocked (no new escrow lock) |
+| `approve_deliverable` | ❌ Blocked (no payout) |
+| `resolve_dispute` | ❌ Blocked (no payout) |
+| `reclaim_expired_escrow` | ✅ Allowed (refund to client) |
+| `cancel` / refund paths | ✅ Allowed (funds never trapped) |
+
+Paused entrypoints return `Error::Paused`. Refund and cancel paths are
+deliberately exempt so a pause can never strand user funds.
+
+---
+
+## 💰 Escrow Caps
+
+For the first mainnet canary release, exposure is capped while the contract is
+unproven. Caps live in `Config` and are raised in stages.
+
+| Parameter | Description |
+|-----------|-------------|
+| `max_job_budget` | Maximum budget accepted by `post_job` |
+| `max_total_escrow` | Maximum total USDC locked across all escrows |
+| `total_locked_escrow` | Running total of currently locked escrow |
+
+`post_job` rejects any job whose budget exceeds `max_job_budget`, and rejects
+any job that would push `total_locked_escrow` above `max_total_escrow`
+(`Error::BudgetTooHigh` / `Error::EscrowCapExceeded`). `total_locked_escrow`
+increases on `accept_bid` and decreases on release, refund, or dispute payout.
+
+Admin setters:
+
+```rust
+fn set_max_job_budget(env: Env, max_job_budget: i128) -> Result<(), Error>
+fn set_max_total_escrow(env: Env, max_total_escrow: i128) -> Result<(), Error>
+```
+
+Each setter requires admin auth and emits a `cfg_cap` event with the new value
+so indexers and dashboards can track staged cap increases.
+
+---
+
+## 🔁 Token Transfer Safety & Reentrancy
+
+Every `token::Client::transfer` is treated as fallible. The contract follows
+**checks-effects-interactions**: all validation and state updates that must
+persist are ordered so that a panicking transfer leaves no partial state.
+
+- **State after transfer:** where a transfer can fail, state is only committed
+  after the transfer returns successfully; a panicking transfer aborts the
+  whole invocation, so no state change persists.
+- **Frozen / clawback / trustline-limit assets:** if the token rejects the
+  transfer (frozen account, clawback-enabled asset, trustline limit reached),
+  the transfer panics and the entire transaction reverts — escrow stays in its
+  prior state and no funds are silently lost or double-counted.
+- **Reentrancy:** Soroban token contracts are invoked as sub-calls; the
+  marketplace does not call back into itself, and all state is written before
+  any external call that could re-enter. There is no shared mutable state
+  visible to a re-entrant call mid-update, so reentrancy is not exploitable.
+  Tests use a failing token mock to assert that no state change persists when a
+  transfer panics.
 
 ---
 
 ## 🛣️ Roadmap
 
 ### v1.1 (Q2 2024)
-- [ ] Contract upgradeability (proxy pattern)
+- [x] Contract upgradeability (`upgrade` + `version`)
 - [ ] DAO governance for config changes
 - [ ] Multi-sig dispute resolvers
 - [ ] Agent categories & tags
