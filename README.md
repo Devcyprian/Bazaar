@@ -349,6 +349,18 @@ fn get_bids_by_job(job_id: u64) -> Vec<u64>
 // Get agents by skill
 fn get_agents_by_skill(skill: String) -> Vec<u64>
 
+// Get dispute ids raised for a job (empty vec for unknown job)
+fn get_disputes_by_job(job_id: u64) -> Vec<u64>
+
+// Get the currently open dispute id for a job, if any
+fn get_open_dispute(job_id: u64) -> Option<u64>
+
+// Get a skill verification by id (verifier, evidence URI, expiry)
+fn get_verification(verification_id: u64) -> Result<SkillVerification, Error>
+
+// Get all skill verification ids for an agent
+fn get_verifications_by_agent(agent: Address) -> Vec<u64>
+
 // Get platform stats
 fn get_platform_stats() -> PlatformStats
 ```

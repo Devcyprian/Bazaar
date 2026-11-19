@@ -196,7 +196,6 @@ pub struct Config {
     pub min_job_budget: i128,
     pub max_job_deadline_days: u64,
     pub dispute_window_days: u64,
-    pub min_agent_reputation: u32,
     pub platform_fee_recipient: Address,
     pub dispute_resolver: Address, // DAO or multisig
     pub min_agent_reputation_to_bid: u32,
@@ -257,7 +256,6 @@ pub enum DataKey {
     DisputesByJob(u64),
     SkillVerification(u64),
     SkillVerificationsByAgent(Address),
-    AgentSkills(u64),
     SkillAgents(String),
     PlatformStats,
     IsPaused,
@@ -385,7 +383,6 @@ impl AiAgentMarketplace {
         min_job_budget: i128,
         max_job_deadline_days: u64,
         dispute_window_days: u64,
-        min_agent_reputation: u32,
         platform_fee_recipient: Address,
         dispute_resolver: Address,
         min_agent_reputation_to_bid: u32,
@@ -423,7 +420,6 @@ impl AiAgentMarketplace {
             min_job_budget,
             max_job_deadline_days,
             dispute_window_days,
-            min_agent_reputation,
             platform_fee_recipient: platform_fee_recipient.clone(),
             dispute_resolver: dispute_resolver.clone(),
             min_agent_reputation_to_bid,
@@ -431,7 +427,9 @@ impl AiAgentMarketplace {
             escrow_expiry_days,
             skill_verifiers,
             require_skill_verification,
-            version: 1,
+            // #105: bumped from 1 to 2 when the unused `min_agent_reputation`
+            // field was removed from the schema.
+            version: 2,
             max_job_budget,
             max_total_escrow,
             total_locked_escrow: 0,
@@ -2052,6 +2050,63 @@ impl AiAgentMarketplace {
         Self::get_dispute(&env, dispute_id)
     }
 
+    /// #107: Get the dispute IDs raised against a job.
+    ///
+    /// Returns an empty Vec when the job has no disputes (including unknown
+    /// job IDs), so callers need not distinguish "no disputes" from "no job".
+    pub fn get_disputes_by_job(env: Env, job_id: u64) -> Vec<u64> {
+        env.storage().instance()
+            .get(&DataKey::DisputesByJob(job_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// #107: Convenience getter returning the first open dispute for a job.
+    ///
+    /// Scans the job's dispute index and returns the ID of the first dispute
+    /// whose status is `DisputeStatus::Open`.  Returns `None` when the job has
+    /// no open dispute (or no disputes at all).
+    pub fn get_open_dispute(env: Env, job_id: u64) -> Option<u64> {
+        let dispute_ids: Vec<u64> = env.storage().instance()
+            .get(&DataKey::DisputesByJob(job_id))
+            .unwrap_or(Vec::new(&env));
+        for dispute_id in dispute_ids.iter() {
+            if let Ok(dispute) = Self::get_dispute(&env, dispute_id) {
+                if dispute.status == DisputeStatus::Open {
+                    return Some(dispute_id);
+                }
+            }
+        }
+        None
+    }
+
+    /// #108: Get a skill verification record by ID.
+    ///
+    /// Returns `None` when no verification with the given ID exists.
+    pub fn get_verification(env: Env, verification_id: u64) -> Option<SkillVerification> {
+        env.storage().instance()
+            .get(&DataKey::SkillVerification(verification_id))
+    }
+
+    /// #108: Get all skill verification records for an agent owner.
+    ///
+    /// Returns the stored `SkillVerification` structs (verifier, evidence URI,
+    /// expiry, etc.) in the order they were recorded.  Returns an empty Vec
+    /// when the address has no verifications.
+    pub fn get_verifications_by_agent(env: Env, agent: Address) -> Vec<SkillVerification> {
+        let ids: Vec<u64> = env.storage().instance()
+            .get(&DataKey::SkillVerificationsByAgent(agent))
+            .unwrap_or(Vec::new(&env));
+        let mut verifications = Vec::new(&env);
+        for id in ids.iter() {
+            if let Some(ver) = env.storage().instance()
+                .get::<DataKey, SkillVerification>(&DataKey::SkillVerification(id))
+            {
+                verifications.push_back(ver);
+            }
+        }
+        verifications
+    }
+
     /// Get review by ID
     pub fn get_review(env: Env, review_id: u64) -> Result<Review, Error> {
         Self::get_review(&env, review_id)
@@ -2270,7 +2325,6 @@ impl AiAgentMarketplace {
         min_job_budget: Option<i128>,
         max_job_deadline_days: Option<u64>,
         dispute_window_days: Option<u64>,
-        min_agent_reputation: Option<u32>,
         platform_fee_recipient: Option<Address>,
         dispute_resolver: Option<Address>,
         min_agent_reputation_to_bid: Option<u32>,
@@ -2327,15 +2381,6 @@ impl AiAgentMarketplace {
                 );
             }
             config.dispute_window_days = days;
-        }
-        if let Some(rep) = min_agent_reputation {
-            if rep != config.min_agent_reputation {
-                env.events().publish(
-                    (symbol_short!("config_upd"), symbol_short!("min_rep")),
-                    (config.min_agent_reputation, rep),
-                );
-            }
-            config.min_agent_reputation = rep;
         }
         if let Some(recipient) = platform_fee_recipient {
             if recipient != config.platform_fee_recipient {
