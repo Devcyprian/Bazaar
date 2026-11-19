@@ -8,6 +8,7 @@
 // - Dispute resolution
 
 #![no_std]
+#![deny(clippy::unwrap_used)]
 use soroban_sdk::{
     auth::Context,
     contract, contracterror, contractimpl, contracttype, symbol_short,
@@ -137,6 +138,18 @@ pub struct Review {
     pub created_at: u64,
 }
 
+/// #121: Aggregated reputation for a client, derived from agent reviews and
+/// job activity.  Exposed via `get_client_stats` so agents can screen clients
+/// before bidding.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientStats {
+    pub rating_sum: u32,
+    pub rating_count: u32,
+    pub jobs_posted: u32,
+    pub disputes: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SkillVerification {
@@ -233,6 +246,10 @@ pub enum DataKey {
     EscrowByJob(u64),
     Review(u64),
     ReviewsByReviewee(Address),
+    /// #123: (job_id, reviewer) -> review_id, for O(1) duplicate checks.
+    ReviewByJobReviewer(u64, Address),
+    /// #121: Aggregated client reputation.
+    ClientStats(Address),
     Dispute(u64),
     DisputesByJob(u64),
     SkillVerification(u64),
@@ -788,6 +805,11 @@ impl AiAgentMarketplace {
         stats.total_jobs += 1;
         env.storage().instance().set(&DataKey::PlatformStats, &stats);
 
+        // #121: track client reputation.
+        let mut client_stats = Self::get_client_stats_internal(&env, &client);
+        client_stats.jobs_posted = client_stats.jobs_posted.saturating_add(1);
+        env.storage().instance().set(&DataKey::ClientStats(client.clone()), &client_stats);
+
         env.events().publish(
             (symbol_short!("job_post"),),
             (job_id, client, budget, deadline),
@@ -1340,6 +1362,11 @@ impl AiAgentMarketplace {
         stats.total_disputes += 1;
         env.storage().instance().set(&DataKey::PlatformStats, &stats);
 
+        // #121: track client reputation.
+        let mut client_stats = Self::get_client_stats_internal(&env, &job.client);
+        client_stats.disputes = client_stats.disputes.saturating_add(1);
+        env.storage().instance().set(&DataKey::ClientStats(job.client.clone()), &client_stats);
+
         env.events().publish(
             (symbol_short!("dispute"),),
             (dispute_id, job_id, raiser, dispute.reason.clone()),
@@ -1475,27 +1502,22 @@ impl AiAgentMarketplace {
             return Err(Error::InvalidRating);
         }
 
-        // Check if already reviewed
-        let existing_reviews: Vec<u64> = env.storage().instance()
-            .get(&DataKey::ReviewsByReviewee(
-                if job.client == reviewer { job.assigned_agent.unwrap() } else { job.client.clone() }
-            ))
-            .unwrap_or(Vec::new(&env));
-
-        for review_id in existing_reviews.iter() {
-            let review = Self::get_review(&env, review_id)?;
-            if review.job_id == job_id && review.reviewer == reviewer {
-                return Err(Error::AlreadyReviewed);
-            }
+        // #123: O(1) duplicate-review check.
+        if env.storage().instance()
+            .has(&DataKey::ReviewByJobReviewer(job_id, reviewer.clone()))
+        {
+            return Err(Error::AlreadyReviewed);
         }
 
         let review_id = Self::next_review_id(&env)?;
         let now = env.ledger().timestamp();
 
-        let reviewee = if job.client == reviewer { 
-            job.assigned_agent.unwrap() 
-        } else { 
-            job.client.clone() 
+        // #122: never unwrap `assigned_agent`; a Completed/Refunded job without
+        // an assigned agent is an error, not a trap.
+        let reviewee = if job.client == reviewer {
+            job.assigned_agent.clone().ok_or(Error::AgentNotFound)?
+        } else {
+            job.client.clone()
         };
 
         let review = Review {
@@ -1509,6 +1531,11 @@ impl AiAgentMarketplace {
         };
 
         env.storage().instance().set(&DataKey::Review(review_id), &review);
+        // #123: index by (job_id, reviewer) for O(1) duplicate checks.
+        env.storage().instance().set(
+            &DataKey::ReviewByJobReviewer(job_id, reviewer.clone()),
+            &review_id,
+        );
 
         // Index review
         let mut reviewee_reviews: Vec<u64> = env.storage().instance()
@@ -1516,6 +1543,14 @@ impl AiAgentMarketplace {
             .unwrap_or(Vec::new(&env));
         reviewee_reviews.push_back(review_id);
         env.storage().instance().set(&DataKey::ReviewsByReviewee(reviewee.clone()), &reviewee_reviews);
+
+        // #121: when the agent reviews the client, update the client's stats.
+        if job.client != reviewer {
+            let mut client_stats = Self::get_client_stats_internal(&env, &reviewee);
+            client_stats.rating_sum = client_stats.rating_sum.saturating_add(rating);
+            client_stats.rating_count = client_stats.rating_count.saturating_add(1);
+            env.storage().instance().set(&DataKey::ClientStats(reviewee.clone()), &client_stats);
+        }
 
         // Update agent reputation when the client reviews the agent
         if job.client == reviewer {
@@ -2046,6 +2081,13 @@ impl AiAgentMarketplace {
         escrow_id.and_then(|id| Self::get_escrow(&env, id).ok())
     }
 
+    /// #121: Get aggregated reputation stats for a client.
+    ///
+    /// Returns zeroed stats when the client has no recorded activity yet.
+    pub fn get_client_stats(env: Env, client: Address) -> ClientStats {
+        Self::get_client_stats_internal(&env, &client)
+    }
+
     /// Get platform configuration
     pub fn get_config(env: Env) -> Result<Config, Error> {
         Self::get_config(&env)
@@ -2088,52 +2130,121 @@ impl AiAgentMarketplace {
             return Err(Error::Unauthorized);
         }
 
+        // #126: emit one `config_upd` event per changed field, carrying
+        // `(field_symbol, old_value, new_value)` so indexers need not refetch.
         if let Some(fee) = platform_fee_bps {
             if fee > 10000 {
                 return Err(Error::InvalidConfig);
             }
+            if fee != config.platform_fee_bps {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("fee_bps")),
+                    (config.platform_fee_bps, fee),
+                );
+            }
             config.platform_fee_bps = fee;
         }
         if let Some(budget) = min_job_budget {
+            if budget != config.min_job_budget {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("min_budget")),
+                    (config.min_job_budget, budget),
+                );
+            }
             config.min_job_budget = budget;
         }
         if let Some(days) = max_job_deadline_days {
+            if days != config.max_job_deadline_days {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("max_days")),
+                    (config.max_job_deadline_days, days),
+                );
+            }
             config.max_job_deadline_days = days;
         }
         if let Some(days) = dispute_window_days {
+            if days != config.dispute_window_days {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("disp_win")),
+                    (config.dispute_window_days, days),
+                );
+            }
             config.dispute_window_days = days;
         }
         if let Some(rep) = min_agent_reputation {
+            if rep != config.min_agent_reputation {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("min_rep")),
+                    (config.min_agent_reputation, rep),
+                );
+            }
             config.min_agent_reputation = rep;
         }
         if let Some(recipient) = platform_fee_recipient {
+            if recipient != config.platform_fee_recipient {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("fee_rcpt")),
+                    (config.platform_fee_recipient.clone(), recipient.clone()),
+                );
+            }
             config.platform_fee_recipient = recipient;
         }
         if let Some(resolver) = dispute_resolver {
+            if resolver != config.dispute_resolver {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("resolver")),
+                    (config.dispute_resolver.clone(), resolver.clone()),
+                );
+            }
             config.dispute_resolver = resolver;
         }
         if let Some(rep) = min_agent_reputation_to_bid {
+            if rep != config.min_agent_reputation_to_bid {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("bid_rep")),
+                    (config.min_agent_reputation_to_bid, rep),
+                );
+            }
             config.min_agent_reputation_to_bid = rep;
         }
         if let Some(fee) = platform_fee_bps_dispute {
+            if fee != config.platform_fee_bps_dispute {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("disp_fee")),
+                    (config.platform_fee_bps_dispute, fee),
+                );
+            }
             config.platform_fee_bps_dispute = fee;
         }
         if let Some(days) = escrow_expiry_days {
+            if days != config.escrow_expiry_days {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("esc_exp")),
+                    (config.escrow_expiry_days, days),
+                );
+            }
             config.escrow_expiry_days = days;
         }
         if let Some(verifiers) = skill_verifiers {
+            if verifiers != config.skill_verifiers {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("verifiers")),
+                    (config.skill_verifiers.clone(), verifiers.clone()),
+                );
+            }
             config.skill_verifiers = verifiers;
         }
         if let Some(flag) = require_skill_verification {
+            if flag != config.require_skill_verification {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("req_skill")),
+                    (config.require_skill_verification, flag),
+                );
+            }
             config.require_skill_verification = flag;
         }
 
         env.storage().instance().set(&DataKey::Config, &config);
-
-        env.events().publish(
-            (symbol_short!("config_upd"),),
-            admin,
-        );
 
         Ok(())
     }
@@ -2331,6 +2442,18 @@ impl AiAgentMarketplace {
         env.storage().instance()
             .get(&DataKey::PlatformStats)
             .ok_or(Error::NotInitialized)
+    }
+
+    /// #121: Read a client's stats, defaulting to zeroed stats when absent.
+    fn get_client_stats_internal(env: &Env, client: &Address) -> ClientStats {
+        env.storage().instance()
+            .get(&DataKey::ClientStats(client.clone()))
+            .unwrap_or(ClientStats {
+                rating_sum: 0,
+                rating_count: 0,
+                jobs_posted: 0,
+                disputes: 0,
+            })
     }
 
     fn next_agent_id(env: &Env) -> Result<u64, Error> {
