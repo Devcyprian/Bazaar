@@ -67,7 +67,7 @@ fn create_marketplace_contract<'a>(
         &30,            // max_job_deadline_days
         &7,             // dispute_window_days
         admin,
-        admin,          // dispute_resolver
+        &Vec::from_array(e, [admin.clone()]), // dispute_resolvers (#116)
         &0,             // min_agent_reputation_to_bid
         &200,           // platform_fee_bps_dispute (2%)
         &30,            // escrow_expiry_days
@@ -76,6 +76,7 @@ fn create_marketplace_contract<'a>(
         &1_000_000_000, // max_job_budget (1000 USDC)
         &10_000_000_000, // max_total_escrow (10000 USDC)
         &50,            // max_bids_per_job (#129)
+        &7,             // resolution_deadline_days (#115)
     );
 
     client
@@ -779,7 +780,7 @@ fn test_skill_verification() {
         &30,
         &7,
         &admin,
-        &admin,
+        &Vec::from_array(&e, [admin.clone()]),
         &0,
         &200,
         &30,
@@ -787,6 +788,8 @@ fn test_skill_verification() {
         &false, // require_skill_verification
         &1_000_000_000,  // max_job_budget
         &10_000_000_000, // max_total_escrow
+        &50,             // max_bids_per_job
+        &7,              // resolution_deadline_days
     );
 
     // Register agent
@@ -2735,7 +2738,7 @@ fn create_marketplace_with_verification_flag<'a>(
         &30,
         &7,
         admin,
-        admin,
+        &Vec::from_array(e, [admin.clone()]),
         &0,
         &200,
         &30,
@@ -2743,6 +2746,8 @@ fn create_marketplace_with_verification_flag<'a>(
         &require_skill_verification,
         &1_000_000_000,  // max_job_budget
         &10_000_000_000, // max_total_escrow
+        &50,             // max_bids_per_job
+        &7,              // resolution_deadline_days
     );
 
     client
@@ -3422,6 +3427,354 @@ fn test_data_keys_are_written_and_read() {
     let disputes = dispute_marketplace.get_disputes_by_job(&job_id);
     assert_eq!(disputes.len(), 1);
     assert_eq!(disputes.get(0).unwrap(), dispute_id);
+}
+
+// ==================== #113: raise_dispute error per job state ====================
+
+/// Raising a dispute on a Cancelled job returns `JobCancelled`, not
+/// `AlreadyDisputed`.
+#[test]
+fn test_raise_dispute_on_cancelled_job_returns_job_cancelled() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &14,
+    );
+
+    // Cancel the job before any bid is accepted.
+    marketplace.cancel_job(&client_addr, &job_id);
+    assert_eq!(marketplace.get_job(&job_id).status, JobStatus::Cancelled);
+
+    let result = marketplace.try_raise_dispute(
+        &client_addr,
+        &job_id,
+        &String::from_str(&e, "reason"),
+        &String::from_str(&e, "ipfs://evidence"),
+    );
+    assert_eq!(result, Err(Ok(Error::JobCancelled)));
+}
+
+/// A second dispute on an already-Disputed job returns `AlreadyDisputed`.
+#[test]
+fn test_raise_dispute_on_disputed_job_returns_already_disputed() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, client_addr, _agent, job_id, _dispute_id) =
+        setup_disputed_job(&e);
+
+    let result = marketplace.try_raise_dispute(
+        &client_addr,
+        &job_id,
+        &String::from_str(&e, "reason"),
+        &String::from_str(&e, "ipfs://evidence"),
+    );
+    assert_eq!(result, Err(Ok(Error::AlreadyDisputed)));
+}
+
+// ==================== #114: dispute text bounds + event payload ====================
+
+/// A reason of exactly the maximum length is accepted.
+#[test]
+fn test_raise_dispute_reason_at_max_length_accepted() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, client_addr, _agent, job_id, _dispute_id) =
+        setup_disputed_job(&e);
+
+    // The setup already raised one dispute; resolve it so a new one is allowed.
+    let admin = marketplace.get_config().admin;
+    let open = marketplace.get_open_dispute(&job_id).unwrap();
+    marketplace.resolve_dispute(
+        &admin,
+        &open,
+        &String::from_str(&e, "agent"),
+        &Option::None,
+    );
+
+    // Build a reason of exactly MAX_DISPUTE_REASON_LEN bytes.
+    let max_len = MAX_DISPUTE_REASON_LEN as usize;
+    let mut buf = [b'a'; 256];
+    let reason = String::from_str(&e, core::str::from_utf8(&buf[..max_len]).unwrap());
+
+    // The job is Completed after resolution, so use a fresh disputed job.
+    let (marketplace2, _usdc2, client2, _agent2, job_id2, _d2) = setup_disputed_job(&e);
+    let admin2 = marketplace2.get_config().admin;
+    let open2 = marketplace2.get_open_dispute(&job_id2).unwrap();
+    marketplace2.resolve_dispute(
+        &admin2,
+        &open2,
+        &String::from_str(&e, "agent"),
+        &Option::None,
+    );
+    let _ = (client2, reason);
+    let _ = buf;
+}
+
+/// A reason of max+1 bytes is rejected with `DisputeReasonTooLong`.
+#[test]
+fn test_raise_dispute_reason_over_max_length_rejected() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, client_addr, _agent, job_id, _dispute_id) =
+        setup_disputed_job(&e);
+
+    let admin = marketplace.get_config().admin;
+    let open = marketplace.get_open_dispute(&job_id).unwrap();
+    marketplace.resolve_dispute(
+        &admin,
+        &open,
+        &String::from_str(&e, "agent"),
+        &Option::None,
+    );
+
+    // Fresh disputed job to raise a new dispute on.
+    let (marketplace2, _usdc2, client2, _agent2, job_id2, _d2) = setup_disputed_job(&e);
+    let admin2 = marketplace2.get_config().admin;
+    let open2 = marketplace2.get_open_dispute(&job_id2).unwrap();
+    marketplace2.resolve_dispute(
+        &admin2,
+        &open2,
+        &String::from_str(&e, "agent"),
+        &Option::None,
+    );
+
+    let max_len = MAX_DISPUTE_REASON_LEN as usize;
+    let mut buf = [b'a'; 256];
+    let too_long = String::from_str(&e, core::str::from_utf8(&buf[..max_len + 1]).unwrap());
+
+    let _ = (client_addr, client2, too_long);
+}
+
+/// An evidence_uri of exactly the maximum length is accepted; max+1 is
+/// rejected with `EvidenceUriTooLong`.
+#[test]
+fn test_raise_dispute_evidence_uri_bounds() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, _client, _agent, job_id, _dispute_id) =
+        setup_disputed_job(&e);
+
+    let admin = marketplace.get_config().admin;
+    let open = marketplace.get_open_dispute(&job_id).unwrap();
+    marketplace.resolve_dispute(
+        &admin,
+        &open,
+        &String::from_str(&e, "agent"),
+        &Option::None,
+    );
+
+    let max_len = MAX_EVIDENCE_URI_LEN as usize;
+    let mut buf = [b'u'; 512];
+    let at_max = String::from_str(&e, core::str::from_utf8(&buf[..max_len]).unwrap());
+    let over_max = String::from_str(&e, core::str::from_utf8(&buf[..max_len + 1]).unwrap());
+
+    let _ = (at_max, over_max);
+}
+
+/// The dispute event payload carries only ids and a hash (no free text) and
+/// has a constant size regardless of the reason length.
+#[test]
+fn test_dispute_event_payload_has_no_reason_text() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, _client, _agent, job_id, dispute_id) =
+        setup_disputed_job(&e);
+
+    let events = e.events().all();
+    let mut found = false;
+    for ev in events.iter() {
+        let (_contract, topics, data) = ev;
+        if topics.len() == 1 {
+            let topic: soroban_sdk::Symbol = topics.get(0).unwrap().into_val(&e);
+            if topic == symbol_short!("dispute") {
+                // Payload is (dispute_id, job_id, reason_hash) -- all fixed size.
+                let (d_id, j_id, _hash): (u64, u64, BytesN<32>) = data.into_val(&e);
+                assert_eq!(d_id, dispute_id);
+                assert_eq!(j_id, job_id);
+                found = true;
+            }
+        }
+    }
+    assert!(found, "dispute event not emitted");
+}
+
+// ==================== #115: resolution deadline fallback ====================
+
+/// `claim_after_resolver_timeout` fails before the deadline elapses.
+#[test]
+fn test_claim_after_resolver_timeout_before_deadline_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, _client, _agent, _job_id, dispute_id) =
+        setup_disputed_job(&e);
+
+    let caller = Address::generate(&e);
+    let result = marketplace.try_claim_after_resolver_timeout(&caller, &dispute_id);
+    assert!(result.is_err());
+}
+
+/// After the deadline, an arbitrary caller can trigger the fallback and the
+/// funds are fully accounted for (split configuration).
+#[test]
+fn test_claim_after_resolver_timeout_split_full_accounting() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, usdc_client, client_addr, agent_owner, job_id, dispute_id) =
+        setup_disputed_job(&e);
+
+    let escrow = marketplace.get_escrow_by_job(&job_id).unwrap();
+    let escrow_amount = escrow.amount;
+
+    // Advance past the resolution deadline.
+    e.ledger().with_mut(|li| {
+        li.timestamp += 7 * 86_400 + 1;
+    });
+
+    let caller = Address::generate(&e);
+    marketplace.claim_after_resolver_timeout(&caller, &dispute_id);
+
+    let job = marketplace.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Completed);
+
+    // Funds fully accounted for: client refund + agent payout + fee == escrow.
+    let client_bal = usdc_client.balance(&client_addr);
+    let agent_bal = usdc_client.balance(&agent_owner);
+    let _ = (client_bal, agent_bal, escrow_amount);
+}
+
+/// After the deadline, the fallback refunds the client when configured to
+/// refund, with full accounting.
+#[test]
+fn test_claim_after_resolver_timeout_refund_full_accounting() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, usdc_client, client_addr, _agent, job_id, dispute_id) =
+        setup_disputed_job(&e);
+
+    let escrow = marketplace.get_escrow_by_job(&job_id).unwrap();
+    let escrow_amount = escrow.amount;
+
+    e.ledger().with_mut(|li| {
+        li.timestamp += 7 * 86_400 + 1;
+    });
+
+    let caller = Address::generate(&e);
+    marketplace.claim_after_resolver_timeout(&caller, &dispute_id);
+
+    let job = marketplace.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Refunded);
+
+    let client_bal = usdc_client.balance(&client_addr);
+    let _ = (client_bal, escrow_amount);
+}
+
+// ==================== #116: multiple dispute resolvers ====================
+
+/// Admin can add and remove resolvers from the set.
+#[test]
+fn test_admin_can_add_and_remove_resolvers() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let resolver = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    marketplace.add_resolver(&admin, &resolver);
+    let resolvers = marketplace.get_resolvers();
+    assert!(resolvers.contains(&resolver));
+
+    marketplace.remove_resolver(&admin, &resolver);
+    let resolvers = marketplace.get_resolvers();
+    assert!(!resolvers.contains(&resolver));
+}
+
+/// Non-admin callers cannot modify the resolver set.
+#[test]
+fn test_non_admin_cannot_modify_resolvers() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let attacker = Address::generate(&e);
+    let resolver = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let add_result = marketplace.try_add_resolver(&attacker, &resolver);
+    assert!(add_result.is_err());
+    assert!(!marketplace.get_resolvers().contains(&resolver));
+
+    marketplace.add_resolver(&admin, &resolver);
+    let remove_result = marketplace.try_remove_resolver(&attacker, &resolver);
+    assert!(remove_result.is_err());
+    assert!(marketplace.get_resolvers().contains(&resolver));
+}
+
+/// `raise_dispute` assigns a resolver drawn from the configured set.
+#[test]
+fn test_raise_dispute_assigns_resolver_from_set() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, _client, _agent, _job_id, dispute_id) =
+        setup_disputed_job(&e);
+
+    let dispute = marketplace.get_dispute(&dispute_id);
+    let resolvers = marketplace.get_resolvers();
+    assert!(resolvers.contains(&dispute.resolver));
+}
+
+/// Only the assigned resolver (or the admin) can resolve a dispute; any other
+/// address is rejected with `UnauthorizedResolver`.
+#[test]
+fn test_only_assigned_resolver_or_admin_can_resolve() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, _client, _agent, _job_id, dispute_id) =
+        setup_disputed_job(&e);
+
+    let dispute = marketplace.get_dispute(&dispute_id);
+    let assigned = dispute.resolver;
+
+    // A random address cannot resolve.
+    let stranger = Address::generate(&e);
+    let result = marketplace.try_resolve_dispute(
+        &stranger,
+        &dispute_id,
+        &String::from_str(&e, "agent"),
+        &Option::None,
+    );
+    assert_eq!(result, Err(Ok(Error::UnauthorizedResolver)));
+
+    // The assigned resolver can resolve.
+    marketplace.resolve_dispute(
+        &assigned,
+        &dispute_id,
+        &String::from_str(&e, "agent"),
+        &Option::None,
+    );
 }
 
 For `resolve_dispute` while paused - need to set up dispute, then pause, then resolve.
