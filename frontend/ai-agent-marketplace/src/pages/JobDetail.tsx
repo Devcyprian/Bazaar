@@ -1,6 +1,6 @@
-import React, { useRef, useState } from 'react';
+import React, { useRef, useState, useEffect } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
@@ -34,6 +34,11 @@ import {
  */
 const ESCROW_EXPIRY_DAYS = 30;
 
+/**
+ * Page size used when paginating the bids index for a job.
+ */
+const BIDS_PAGE_SIZE = 20;
+
 // ── JobDetail component ────────────────────────────────────────────────────────
 export const JobDetail: React.FC = () => {
   const { jobId } = useParams<{ jobId: string }>();
@@ -60,6 +65,7 @@ export const JobDetail: React.FC = () => {
   // CID of the last successfully submitted deliverable (shown in the job detail)
   const [submittedDeliverableCid, setSubmittedDeliverableCid] = useState<string | null>(null);
   const deliverableFileRef = useRef<HTMLInputElement>(null);
+  const loadMoreBidsRef = useRef<HTMLDivElement>(null);
 
   const jobIdNum = parseInt(jobId || '0');
 
@@ -89,21 +95,54 @@ export const JobDetail: React.FC = () => {
     enabled: !!jobIdNum,
   });
 
-  // ── bids query (fetched separately via the index) ──────────────────────────
+  // ── bids query (paginated via the index) ───────────────────────────────────
   const {
-    data: bids = [],
+    data: bidsPages,
     error: bidsError,
     refetch: refetchBids,
-  } = useQuery<Bid[]>({
+    fetchNextPage: fetchNextBidsPage,
+    hasNextPage: hasNextBidsPage,
+    isFetchingNextPage: isFetchingNextBidsPage,
+  } = useInfiniteQuery<Bid[], Error>({
     queryKey: ['job-bids', jobIdNum],
-    queryFn: async () => {
+    queryFn: async ({ pageParam = 0 }) => {
       const client = getContractClient();
       if (!client) return [];
-      const ids = await client.getBidsByJob(jobIdNum, 0, 50);
+      const offset = pageParam as number;
+      const ids = await client.getBidsByJob(jobIdNum, offset, BIDS_PAGE_SIZE);
       return Promise.all(ids.map((id) => client.getBid(id)));
+    },
+    initialPageParam: 0,
+    getNextPageParam: (lastPage, allPages) => {
+      if (lastPage.length !== BIDS_PAGE_SIZE) return undefined;
+      return allPages.reduce((acc, page) => acc + page.length, 0);
     },
     enabled: !!jobIdNum,
   });
+
+  const bids: Bid[] = bidsPages?.pages.flat() ?? [];
+
+  // ── infinite-scroll sentinel for the bids list ─────────────────────────────
+  useEffect(() => {
+    const sentinel = loadMoreBidsRef.current;
+    if (!sentinel) return;
+    if (typeof IntersectionObserver === 'undefined') return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        if (
+          entry?.isIntersecting &&
+          hasNextBidsPage &&
+          !isFetchingNextBidsPage
+        ) {
+          void fetchNextBidsPage();
+        }
+      },
+      { rootMargin: '200px' },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [hasNextBidsPage, isFetchingNextBidsPage, fetchNextBidsPage]);
 
   // ── derived state ──────────────────────────────────────────────────────────
   const isClient = publicKey === job?.client;
@@ -773,433 +812,32 @@ export const JobDetail: React.FC = () => {
                     )}
                   </div>
                 ) : (
-                  <div className="divide-y">
-                    {bids.map((bid) => (
-                      <div key={bid.id} className="p-5 hover:bg-muted/50">
-                        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-                          <div className="flex-1">
-                            <div className="flex items-center gap-3 mb-2">
-                              <Badge
-                                variant={
-                                  bid.status === 'Accepted'
-                                    ? 'success'
-                                    : bid.status === 'Rejected'
-                                    ? 'destructive'
-                                    : 'default'
-                                }
-                              >
-                                {bid.status}
-                              </Badge>
-                              <span className="font-medium text-lg">{formatPrice(bid.amount)}</span>
-                              <span className="text-sm text-muted-foreground">
-                                {bid.agent.slice(0, 8)}…
-                              </span>
-                              <span className="text-sm text-muted-foreground">
-                                {formatDistanceToNow(new Date(bid.submittedAt * 1000), {
-                                  addSuffix: true,
-                                })}
-                              </span>
-                            </div>
-                            <p className="text-muted-foreground text-sm mb-2">{bid.proposal}</p>
-                            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                              <span>
-                                Timeline:{' '}
-                                {Math.max(
-                                  0,
-                                  Math.ceil(
-                                    (bid.proposedTimeline * 1000 - Date.now()) /
-                                      (1000 * 60 * 60 * 24),
-                                  ),
-                                )}{' '}
-                                days
-                              </span>
-                              <span>Agent ID: #{bid.agentId}</span>
-                            </div>
-                          </div>
-                          {isClient && bid.status === 'Pending' && (
-                            <Button size="sm" onClick={() => handleAcceptBid(bid.id)} disabled={isActing}>
-                              Accept Bid
-                            </Button>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-          )}
-
-          {/* ── Activity Tab ── */}
-          {activeTab === 'activity' && (
-            <Card>
-              <CardContent className="p-0">
-                <div className="divide-y">
-                  <ActivityItem
-                    icon={DollarSign}
-                    color="text-green-500"
-                    title="Job Posted"
-                    description={`Job created with budget of ${formatPrice(job.budget)}`}
-                    time={job.createdAt}
-                  />
-                  {bids.map((bid) => (
-                    <ActivityItem
-                      key={bid.id}
-                      icon={Send}
-                      color="text-primary"
-                      title="Bid Received"
-                      description={`${bid.agent.slice(0, 8)}… bid ${formatPrice(bid.amount)} (${bid.status})`}
-                      time={bid.submittedAt}
-                    />
-                  ))}
-                  {job.assignedAgent && (
-                    <ActivityItem
-                      icon={CheckCircle}
-                      color="text-primary"
-                      title="Bid Accepted"
-                      description={`Assigned to ${job.assignedAgent.slice(0, 8)}…`}
-                      time={job.createdAt + 86400}
-                    />
-                  )}
-                  {job.status === 'InProgress' && (
-                    <ActivityItem
-                      icon={Clock}
-                      color="text-orange-500"
-                      title="Work Started"
-                      description="Agent began work on the deliverable"
-                      time={job.createdAt + 86400 * 2}
-                    />
-                  )}
-                  {job.deliverableHash && (
-                    <ActivityItem
-                      icon={FileText}
-                      color="text-blue-500"
-                      title="Deliverable Submitted"
-                      description="Agent submitted work for review"
-                      time={job.createdAt + 86400 * 5}
-                    />
-                  )}
-                  {job.status === 'Completed' && job.completedAt && (
-                    <ActivityItem
-                      icon={CheckCircle}
-                      color="text-green-500"
-                      title="Job Completed"
-                      description="Client approved deliverable, payment released"
-                      time={job.completedAt}
-                    />
-                  )}
-                  {job.disputeRaised && (
-                    <ActivityItem
-                      icon={AlertCircle}
-                      color="text-destructive"
-                      title="Dispute Raised"
-                      description="Dispute resolution initiated"
-                      time={job.createdAt + 86400 * 7}
-                    />
-                  )}
-                  {job.status === 'Refunded' && (
-                    <ActivityItem
-                      icon={XCircle}
-                      color="text-destructive"
-                      title="Refunded"
-                      description="Payment refunded to client"
-                      time={job.createdAt + 86400 * 10}
-                    />
-                  )}
-                  {job.escrowCreatedAt && isEscrowExpired && (
-                    <ActivityItem
-                      icon={RefreshCw}
-                      color="text-orange-500"
-                      title="Escrow Funds Reclaimed"
-                      description="Client reclaimed escrowed funds after expiry window"
-                      time={job.escrowCreatedAt + ESCROW_EXPIRY_DAYS * 86400 + 1}
-                    />
-                  )}
-                </div>
-              </CardContent>
-            </Card>
-          )}
-        </div>
-      </main>
-
-      {/* ── Bid Modal ── */}
-      {showBidModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
-          <Card className="w-full max-w-md max-h-[90vh] overflow-y-auto">
-            <CardHeader>
-              <CardTitle>Place Bid on "{job.title}"</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="p-3 bg-muted rounded-lg text-sm">
-                <p className="text-muted-foreground">
-                  Budget:{' '}
-                  <span className="font-medium text-foreground">{formatPrice(job.budget)}</span>
-                </p>
-                <p className="text-muted-foreground">
-                  Minimum bid:{' '}
-                  <span className="font-medium text-foreground">
-                    {formatPrice(job.budget / 2)}
-                  </span>{' '}
-                  (50% of budget)
-                </p>
-              </div>
-              <Input
-                label="Your Bid Amount (USDC)"
-                type="number"
-                step="0.01"
-                min={job.budget / 2 / 10000000}
-                max={job.budget / 10000000}
-                value={bidAmount}
-                onChange={(e) => setBidAmount(e.target.value)}
-                placeholder="e.g., 100.00"
-              />
-              <Input
-                label="Proposed Timeline (days)"
-                type="number"
-                min="1"
-                max={daysLeft > 0 ? daysLeft : 30}
-                value={bidTimeline}
-                onChange={(e) => setBidTimeline(e.target.value)}
-                placeholder="e.g., 7"
-              />
-              <Textarea
-                label="Proposal"
-                value={bidProposal}
-                onChange={(e) => setBidProposal(e.target.value)}
-                placeholder="Describe your approach, relevant experience, and why you're the best fit for this job…"
-                rows={4}
-              />
-              <div className="flex gap-2 pt-2">
-                <Button
-                  variant="outline"
-                  onClick={() => setShowBidModal(false)}
-                  className="flex-1"
-                >
-                  Cancel
-                </Button>
-                <Button
-                  onClick={handleBid}
-                  className="flex-1"
-                  disabled={!bidAmount || !bidTimeline || !bidProposal || isActing}
-                  isLoading={isActing}
-                >
-                  Submit Bid
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      )}
-
-      {/* ── Submit Deliverable Modal ── */}
-      {showDeliverableModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
-          <Card className="w-full max-w-lg max-h-[90vh] overflow-y-auto">
-            <CardHeader>
-              <CardTitle>Submit Deliverable for &ldquo;{job.title}&rdquo;</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-5">
-              {/* File upload */}
-              <div>
-                <label className="block text-sm font-medium mb-2">
-                  Deliverable File
-                </label>
-                <div
-                  className={clsx(
-                    'border-2 border-dashed rounded-lg p-6 text-center transition-colors',
-                    deliverableFile
-                      ? 'border-primary/50 bg-primary/5'
-                      : 'border-border hover:border-primary/40',
-                  )}
-                  onDragOver={(e) => e.preventDefault()}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    const f = e.dataTransfer.files[0];
-                    if (f) {
-                      setDeliverableFile(f);
-                      setDeliverableIpfsCid(null);
-                      setDeliverableUploadProgress({ percent: null, status: 'idle' });
-                    }
-                  }}
-                >
-                  <input
-                    ref={deliverableFileRef}
-                    type="file"
-                    id="deliverable-file-input"
-                    className="hidden"
-                    onChange={(e) => {
-                      const f = e.target.files?.[0] ?? null;
-                      setDeliverableFile(f);
-                      setDeliverableIpfsCid(null);
-                      setDeliverableUploadProgress({ percent: null, status: 'idle' });
-                    }}
-                    aria-label="Select deliverable file to upload"
-                  />
-                  <label
-                    htmlFor="deliverable-file-input"
-                    className="flex flex-col items-center gap-2 cursor-pointer"
-                  >
-                    <Upload className="h-8 w-8 text-muted-foreground" />
-                    {deliverableFile ? (
-                      <span className="font-medium text-sm">{deliverableFile.name}</span>
-                    ) : (
-                      <>
-                        <span className="font-medium text-sm">Drop a file or click to browse</span>
-                        <span className="text-xs text-muted-foreground">
-                          Any file type accepted — it will be uploaded to IPFS
-                        </span>
-                      </>
-                    )}
-                  </label>
-                </div>
-                {deliverableFile && (
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Size: {(deliverableFile.size / 1024).toFixed(1)} KB
-                  </p>
-                )}
-              </div>
-
-              {/* Optional text description */}
-              <Textarea
-                label="Description / External Link (optional)"
-                value={deliverableNote}
-                onChange={(e) => setDeliverableNote(e.target.value)}
-                placeholder="Add a description, GitHub link, or any notes for the client. If no file is uploaded, this text will be hashed as the proof."
-                rows={3}
-              />
-
-              {/* Upload progress */}
-              {deliverableUploadProgress.status === 'uploading' && (
-                <div className="flex items-center gap-3 p-3 bg-primary/5 border border-primary/20 rounded-lg">
-                  <Loader2 className="h-4 w-4 animate-spin text-primary flex-shrink-0" />
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium text-primary">Uploading to IPFS…</p>
-                    {deliverableUploadProgress.percent !== null && (
-                      <div className="mt-1 h-1.5 bg-primary/20 rounded-full overflow-hidden">
-                        <div
-                          className="h-full bg-primary transition-all duration-300"
-                          style={{ width: `${deliverableUploadProgress.percent}%` }}
-                        />
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {/* Uploaded CID preview */}
-              {deliverableIpfsCid && (
-                <div className="p-3 bg-green-500/10 border border-green-500/20 rounded-lg space-y-2">
-                  <div className="flex items-center gap-2">
-                    <CheckCircle className="h-4 w-4 text-green-500 flex-shrink-0" />
-                    <span className="text-sm font-medium text-green-500">
-                      Uploaded to IPFS
-                    </span>
-                  </div>
-                  <code className="text-xs break-all font-mono bg-muted px-2 py-1 rounded block">
-                    {deliverableIpfsCid}
-                  </code>
-                  <a
-                    href={ipfsUriToUrl(cidToUri(deliverableIpfsCid))}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
-                  >
-                    <ExternalLink className="h-3 w-3" />
-                    Preview on IPFS gateway
-                  </a>
-                </div>
-              )}
-
-              {/* IPFS not configured warning */}
-              {!isIpfsConfigured() && deliverableFile && (
-                <div className="flex items-start gap-3 p-3 bg-orange-500/10 border border-orange-500/20 rounded-lg">
-                  <AlertCircle className="h-4 w-4 text-orange-500 flex-shrink-0 mt-0.5" />
-                  <div className="text-xs text-orange-500">
-                    <p className="font-medium">IPFS not configured</p>
-                    <p className="text-muted-foreground mt-0.5">
-                      The file will be hashed locally but not pinned to IPFS.
-                      Set <code className="bg-muted px-1 rounded">VITE_IPFS_API_KEY</code> to
-                      enable persistent storage.
-                    </p>
-                  </div>
-                </div>
-              )}
-
-              <div className="flex gap-2 pt-2">
-                <Button
-                  variant="outline"
-                  onClick={() => {
-                    setShowDeliverableModal(false);
-                    setDeliverableFile(null);
-                    setDeliverableNote('');
-                    setDeliverableIpfsCid(null);
-                    setDeliverableUploadProgress({ percent: null, status: 'idle' });
-                    if (deliverableFileRef.current) deliverableFileRef.current.value = '';
-                  }}
-                  className="flex-1"
-                >
-                  Cancel
-                </Button>
-                <Button
-                  onClick={handleSubmitDeliverable}
-                  className="flex-1"
-                  disabled={
-                    (!deliverableFile && !deliverableNote.trim()) ||
-                    isActing ||
-                    deliverableUploadProgress.status === 'uploading'
-                  }
-                  isLoading={isActing}
-                >
-                  Submit Deliverable
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      )}
-    </div>
-  );
-};
-
-// ── ActivityItem ───────────────────────────────────────────────────────────────
-function ActivityItem({
-  icon: Icon,
-  color,
-  title,
-  description,
-  time,
-}: {
-  icon: React.ComponentType<{ className?: string }>;
-  color: string;
-  title: string;
-  description: string;
-  time: number;
-}) {
-  return (
-    <div className="p-5 flex gap-4">
-      <div
-        className={clsx(
-          'flex-shrink-0 w-10 h-10 rounded-full flex items-center justify-center',
-          `${color}/10`,
-        )}
-      >
-        <Icon className={clsx('h-5 w-5', color)} />
-      </div>
-      <div className="flex-1 min-w-0">
-        <p className="font-medium">{title}</p>
-        <p className="text-sm text-muted-foreground truncate">{description}</p>
-      </div>
-      <div className="flex-shrink-0 text-right">
-        <p className="text-sm text-muted-foreground">
-          {format(new Date(time * 1000), 'MMM d, HH:mm')}
-        </p>
-        <p className="text-xs text-muted-foreground">
-          {formatDistanceToNow(new Date(time * 1000), { addSuffix: true })}
-        </p>
-      </div>
-    </div>
-  );
-}
-
-// Mock data removed — JobDetail now reads job, bids and escrow directly from
-// the on-chain contract via MarketplaceClient.
+                  <>
+                    <div className="divide-y">
+                      {bids.map((bid) => (
+                        <div key={bid.id} className="p-5 hover:bg-muted/50">
+                          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                            <div className="flex-1">
+                              <div className="flex items-center gap-3 mb-2">
+                                <Badge
+                                  variant={
+                                    bid.status === 'Accepted'
+                                      ? 'success'
+                                      : bid.status === 'Rejected'
+                                      ? 'destructive'
+                                      : 'default'
+                                  }
+                                >
+                                  {bid.status}
+                                </Badge>
+                                <span className="font-medium text-lg">{formatPrice(bid.amount)}</span>
+                                <span className="text-sm text-muted-foreground">
+                                  {bid.agent.slice(0, 8)}…
+                                </span>
+                                <span className="text-sm text-muted-foreground">
+                                  {formatDistanceToNow(new Date(bid.submittedAt * 1000), {
+                                    addSuffix: true,
+                                  })}
+                                </span>
+                              </div>
+                              <p className="text-muted-foreground text
