@@ -1779,11 +1779,11 @@ impl AiAgentMarketplace {
         if limit == 0 || offset >= total {
             return Vec::new(env);
         }
-        let start = offset as u32;
-        let end_exclusive = ((offset + limit).min(total)) as u32;
+        let start = offset.min(total);
+        let end_exclusive = (start + limit).min(total);
         let mut page = Vec::new(env);
         for i in start..end_exclusive {
-            page.push_back(all.get(i).unwrap());
+            page.push_back(all.get(i as u32).unwrap());
         }
         page
     }
