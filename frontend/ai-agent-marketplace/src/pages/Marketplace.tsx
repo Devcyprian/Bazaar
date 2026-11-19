@@ -59,6 +59,7 @@ export const Marketplace: React.FC = () => {
       }
       if (selectedSkills.length > 0) {
         // Intersect agent IDs returned per selected skill, then hydrate.
+        // Each skill query is paginated with the same offset/limit window.
         const sets = await Promise.all(
           selectedSkills.map((skill: string) => client.getAgentsBySkill(skill, offset, PAGE_SIZE)),
         );
@@ -125,6 +126,8 @@ export const Marketplace: React.FC = () => {
 
   // ── Intersection observers for infinite scroll ────────────────────────────
   useEffect(() => {
+    const sentinel = agentsSentinelRef.current;
+    if (!sentinel) return;
     const observer = new IntersectionObserver(
       entries => {
         if (entries[0].isIntersecting && hasNextAgentsPage && !isFetchingNextAgentsPage) {
@@ -133,11 +136,13 @@ export const Marketplace: React.FC = () => {
       },
       { threshold: 0.1 }
     );
-    if (agentsSentinelRef.current) observer.observe(agentsSentinelRef.current);
+    observer.observe(sentinel);
     return () => observer.disconnect();
   }, [hasNextAgentsPage, isFetchingNextAgentsPage, fetchNextAgentsPage]);
 
   useEffect(() => {
+    const sentinel = jobsSentinelRef.current;
+    if (!sentinel) return;
     const observer = new IntersectionObserver(
       entries => {
         if (entries[0].isIntersecting && hasNextJobsPage && !isFetchingNextJobsPage) {
@@ -146,7 +151,7 @@ export const Marketplace: React.FC = () => {
       },
       { threshold: 0.1 }
     );
-    if (jobsSentinelRef.current) observer.observe(jobsSentinelRef.current);
+    observer.observe(sentinel);
     return () => observer.disconnect();
   }, [hasNextJobsPage, isFetchingNextJobsPage, fetchNextJobsPage]);
 
@@ -441,6 +446,15 @@ export const Marketplace: React.FC = () => {
                       Loading more agents…
                     </div>
                   )}
+                  {!isFetchingNextAgentsPage && hasNextAgentsPage && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => fetchNextAgentsPage()}
+                    >
+                      Load more agents
+                    </Button>
+                  )}
                   {!hasNextAgentsPage && filteredAgents.length > 0 && (
                     <p className="text-sm text-muted-foreground">All agents loaded</p>
                   )}
@@ -480,6 +494,15 @@ export const Marketplace: React.FC = () => {
                       <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
                       Loading more jobs…
                     </div>
+                  )}
+                  {!isFetchingNextJobsPage && hasNextJobsPage && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => fetchNextJobsPage()}
+                    >
+                      Load more jobs
+                    </Button>
                   )}
                   {!hasNextJobsPage && filteredJobs.length > 0 && (
                     <p className="text-sm text-muted-foreground">All jobs loaded</p>

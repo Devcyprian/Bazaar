@@ -545,6 +545,9 @@ Soroban RPC or Freighter wallet is required. Run in any environment.
 - [ ] Set up monitoring (Sentry, Datadog)
 - [ ] Load test with k6
 - [ ] Disaster recovery plan
+- [ ] Complete testnet rehearsal ([report](docs/mainnet/rehearsal-report.md))
+- [ ] Legal sign-off on sanctions/region restrictions ([record](docs/compliance/legal-signoff.md))
+- [ ] Review [incident runbook](docs/incidents/runbook.md) and confirm status page
 
 ### Deploy Contract (Mainnet)
 
@@ -616,9 +619,108 @@ env.events().publish(("review",), (review_id, job_id, reviewer, reviewee, rating
 
 ---
 
+## ⚖️ Compliance
+
+Real-money marketplaces may be required to restrict sanctioned addresses and
+regions. The marketplace supports this at two layers, both configurable
+**without redeploying** the contract.
+
+### Sanctions & Region Blocklist
+
+| Layer | Mechanism | Managed by |
+|-------|-----------|------------|
+| Frontend | Configurable blocklist check before any post/bid action | Ops (env/config) |
+| Contract | On-chain denylist checked in `post_job` and `place_bid` | Admin multisig |
+
+- **Blocked address cannot post or bid.** Both `post_job` and `place_bid`
+  reject callers whose address is on the denylist, and the frontend blocks
+  the action before a transaction is built.
+- **List managed without redeploy.** The admin multisig can add or remove
+  addresses at any time via the denylist management entry points; no contract
+  upgrade is required.
+- **Region restrictions** are enforced in the frontend by gating the
+  post/bid flows for restricted jurisdictions.
+
+### Admin Denylist Management
+
+```rust
+// Add an address to the denylist (admin multisig only)
+fn add_to_denylist(admin: Address, address: Address) -> Result<(), Error>
+
+// Remove an address from the denylist (admin multisig only)
+fn remove_from_denylist(admin: Address, address: Address) -> Result<(), Error>
+
+// Check whether an address is blocked
+fn is_denylisted(address: Address) -> bool
+```
+
+All denylist changes emit events for auditability and indexing.
+
+### Legal Sign-Off
+
+Legal review of the sanctions screening and region restriction policy is
+tracked in [`docs/compliance/legal-signoff.md`](docs/compliance/legal-signoff.md).
+The sign-off record must be updated before enabling restrictions on mainnet.
+
+---
+
+## 🧪 Mainnet Rehearsal Report
+
+The full mainnet release checklist was rehearsed end-to-end on **testnet**
+before the first mainnet deploy. Full report:
+[`docs/mainnet/rehearsal-report.md`](docs/mainnet/rehearsal-report.md).
+
+| Drill | Result | Notes |
+|-------|--------|-------|
+| Multisig admin setup | ✅ Passed | Admin actions executed via multisig |
+| Caps configuration | ✅ Passed | Fee/budget caps applied and verified |
+| Pause drill | ✅ Passed | `set_paused` halted mutating calls; unpause restored |
+| Upgrade drill | ✅ Passed | New WASM deployed and state preserved |
+| Reconciliation | ✅ Passed | On-chain state matched indexer/ledger records |
+
+Issues found during the rehearsal were fixed and re-tested before sign-off.
+
+---
+
+## 🚨 Incident Response
+
+The incident runbook covers pause authority, communication channels, the
+status page, and the post-mortem template:
+[`docs/incidents/runbook.md`](docs/incidents/runbook.md).
+
+### Pause Authority
+
+- The contract exposes an emergency pause (`set_paused`) controllable by the
+  platform admin (multisig on mainnet).
+- Only the admin multisig may pause or unpause; the action emits an event.
+
+### Communication Channels
+
+| Channel | Purpose |
+|---------|---------|
+| Status page | Real-time incident status and updates |
+| Discord | Community announcements and support |
+| Twitter | Public incident announcements |
+| Email | Direct notification to affected users |
+
+### Status Page
+
+A public status page is maintained for uptime and incident communication.
+Incidents are posted with severity, affected components, and updates until
+resolution.
+
+### Post-Mortem Template
+
+After every incident, a blameless post-mortem is written covering: summary,
+timeline, impact, root cause, detection, response, and follow-up actions with
+owners and due dates.
+
+---
+
 ## 🔐 Security
 
 ### Smart Contract
+=======
 
 - ✅ **Circuit Breaker** — Emergency pause (`set_paused`) controllable by platform admin
 - ✅ **Reentrancy protection** — Single-entry patterns, no external calls before state updates

@@ -10,6 +10,7 @@ import { Textarea } from '@/components/ui/Textarea';
 import { Badge } from '@/components/ui/Badge';
 import { useWallet } from '@/contexts/WalletContext';
 import { useStellar } from '@/contexts/StellarContext';
+import { isAddressBlocked } from '@/lib/compliance';
 import { 
   DollarSign, Clock, Star, User, CheckCircle, AlertCircle, 
   ArrowLeft, Send, Wallet, Loader2, Plus, X, Tag, ArrowUpDown,
@@ -53,6 +54,7 @@ export const CreateJob: React.FC = () => {
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [expandedCategories, setExpandedCategories] = useState<string[]>(['Languages', 'AI/ML']);
+  const [complianceError, setComplianceError] = useState<string | null>(null);
 
   const {
     register,
@@ -99,10 +101,29 @@ export const CreateJob: React.FC = () => {
     }
 
     setIsSubmitting(true);
+    setComplianceError(null);
     try {
       const client = getContractClient();
       if (!client) {
         throw new Error('Not connected to the marketplace contract. Configure it in Settings.');
+      }
+
+      // Compliance: block sanctioned / restricted addresses before posting.
+      let blocked = isAddressBlocked(publicKey);
+      if (!blocked && typeof client.isAddressBlocked === 'function') {
+        try {
+          blocked = await client.isAddressBlocked(publicKey);
+        } catch (checkErr) {
+          console.warn('On-chain blocklist check failed:', checkErr);
+        }
+      }
+      if (blocked) {
+        const message =
+          'Compliance restriction: this wallet address is blocked and cannot post jobs. ' +
+          'If you believe this is an error, please contact support.';
+        setComplianceError(message);
+        alert(message);
+        return;
       }
 
       await client.postJob(publicKey, signTransaction, {
@@ -162,6 +183,18 @@ export const CreateJob: React.FC = () => {
             Describe your project and find the perfect AI agent. Funds are held in escrow until delivery.
           </p>
         </div>
+
+        {complianceError && (
+          <div className="mb-6 p-4 bg-destructive/10 border border-destructive/20 rounded-lg" role="alert">
+            <div className="flex items-start gap-3">
+              <AlertCircle className="h-5 w-5 text-destructive mt-0.5" />
+              <div className="text-sm text-destructive">
+                <p className="font-medium">Compliance Restriction</p>
+                <p>{complianceError}</p>
+              </div>
+            </div>
+          </div>
+        )}
 
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-8">
           {/* Basic Info */}

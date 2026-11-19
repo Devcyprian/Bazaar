@@ -38,7 +38,8 @@ export const AgentProfile: React.FC = () => {
     enabled: !!agentIdNum,
   });
 
-  // Fetch agent's jobs (paginated)
+  // Fetch agent's jobs (paginated). The contract returns a page of job IDs
+  // for (offset, limit); we then resolve each ID to its full Job record.
   const {
     data: jobsPages,
     fetchNextPage: fetchNextJobsPage,
@@ -46,10 +47,10 @@ export const AgentProfile: React.FC = () => {
     isFetchingNextPage: isFetchingNextJobsPage,
     error: jobsError,
     refetch: refetchJobs,
-  } = useInfiniteQuery<Job[]>({
-    queryKey: ['agent-jobs', agentIdNum],
+  } = useInfiniteQuery<Job[], Error, { pages: Job[][] }, readonly ['agent-jobs', number], number>({
+    queryKey: ['agent-jobs', agentIdNum] as const,
     queryFn: async ({ pageParam }) => {
-      const offset = (pageParam as number) ?? 0;
+      const offset = pageParam ?? 0;
       const client = getContractClient();
       if (!client) {
         throw new Error('Not connected to the marketplace contract. Configure it in Settings.');
@@ -66,7 +67,7 @@ export const AgentProfile: React.FC = () => {
         : undefined,
   });
 
-  // Fetch reviews (paginated)
+  // Fetch reviews (paginated). Same offset/limit scheme as jobs above.
   const {
     data: reviewsPages,
     fetchNextPage: fetchNextReviewsPage,
@@ -74,10 +75,10 @@ export const AgentProfile: React.FC = () => {
     isFetchingNextPage: isFetchingNextReviewsPage,
     error: reviewsError,
     refetch: refetchReviews,
-  } = useInfiniteQuery<Review[]>({
-    queryKey: ['agent-reviews', agentIdNum],
+  } = useInfiniteQuery<Review[], Error, { pages: Review[][] }, readonly ['agent-reviews', number], number>({
+    queryKey: ['agent-reviews', agentIdNum] as const,
     queryFn: async ({ pageParam }) => {
-      const offset = (pageParam as number) ?? 0;
+      const offset = pageParam ?? 0;
       const client = getContractClient();
       if (!client) {
         throw new Error('Not connected to the marketplace contract. Configure it in Settings.');
