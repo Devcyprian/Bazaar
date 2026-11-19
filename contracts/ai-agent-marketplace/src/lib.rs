@@ -374,7 +374,15 @@ pub struct AiAgentMarketplace;
 
 #[contractimpl]
 impl AiAgentMarketplace {
-    /// Initialize the marketplace contract
+    /// Initialize the marketplace contract.
+    ///
+    /// #102: Requires authorization from `admin`.  Deployments MUST deploy and
+    /// initialize atomically (e.g. via the deploy script or a `__constructor`
+    /// where supported) so that a third party cannot front-run the
+    /// initialization and choose the admin, fee recipient, resolver and token.
+    ///
+    /// #103: All `Config` fields are validated via `validate_config` before
+    /// anything is persisted.  See that helper for the documented rules.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -391,12 +399,12 @@ impl AiAgentMarketplace {
         skill_verifiers: Vec<Address>,
         require_skill_verification: bool,
     ) -> Result<(), Error> {
+        // #102: the admin must authorize initialization.  This prevents a
+        // front-runner from initializing the contract with their own admin.
+        admin.require_auth();
+
         if Self::has_config(&env) {
             return Err(Error::AlreadyInitialized);
-        }
-
-        if platform_fee_bps > 10000 {
-            return Err(Error::InvalidConfig);
         }
 
         // #132: Verify the configured token is a 7-decimal Stellar Asset
@@ -435,6 +443,9 @@ impl AiAgentMarketplace {
             total_locked_escrow: 0,
             max_bids_per_job: DEFAULT_MAX_BIDS_PER_JOB,
         };
+
+        // #103 / #104: validate every field before persisting.
+        Self::validate_config(&config)?;
 
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::AgentCounter, &0u64);
@@ -2344,9 +2355,6 @@ impl AiAgentMarketplace {
         // #126: emit one `config_upd` event per changed field, carrying
         // `(field_symbol, old_value, new_value)` so indexers need not refetch.
         if let Some(fee) = platform_fee_bps {
-            if fee > 10000 {
-                return Err(Error::InvalidConfig);
-            }
             if fee != config.platform_fee_bps {
                 env.events().publish(
                     (symbol_short!("config_upd"), symbol_short!("fee_bps")),
@@ -2446,6 +2454,9 @@ impl AiAgentMarketplace {
             config.require_skill_verification = flag;
         }
 
+        // #103 / #104: validate the fully-applied config before persisting.
+        Self::validate_config(&config)?;
+
         env.storage().instance().set(&DataKey::Config, &config);
 
         Ok(())
@@ -2514,6 +2525,45 @@ impl AiAgentMarketplace {
 
     fn has_config(env: &Env) -> bool {
         env.storage().instance().has(&DataKey::Config)
+    }
+
+    /// #103 / #104: Validate every `Config` field.
+    ///
+    /// Rules:
+    /// - `min_job_budget` must be strictly positive (`> 0`), otherwise
+    ///   zero-value jobs would be allowed through.
+    /// - `max_job_deadline_days`, `dispute_window_days` and
+    ///   `escrow_expiry_days` must be strictly positive (`> 0`); a zero
+    ///   deadline cap would make `post_job` always fail.
+    /// - `platform_fee_bps` and `platform_fee_bps_dispute` must be within
+    ///   `0..=10000` basis points (0% to 100%).
+    /// - `min_agent_reputation_to_bid` must be within `0..=100` because
+    ///   reputation is stored as a 0-100 score (rating * 20).
+    ///
+    /// Returns `Error::InvalidConfig` when any rule is violated.
+    fn validate_config(config: &Config) -> Result<(), Error> {
+        if config.min_job_budget <= 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if config.max_job_deadline_days == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if config.dispute_window_days == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if config.escrow_expiry_days == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if config.platform_fee_bps > 10000 {
+            return Err(Error::InvalidConfig);
+        }
+        if config.platform_fee_bps_dispute > 10000 {
+            return Err(Error::InvalidConfig);
+        }
+        if config.min_agent_reputation_to_bid > 100 {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
     }
 
     /// #172: Extend the contract instance TTL.  Called on every entrypoint so
