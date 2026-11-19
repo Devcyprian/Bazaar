@@ -72,6 +72,11 @@ jobs:
           cargo test --all pause
           cargo test --all upgrade
 
+      # Fails if any entrypoint exceeds 70% of the mainnet CPU or memory
+      # limits (see docs/BUDGETS.md).
+      - name: Budget regression check
+        run: cargo test --all budget -- --nocapture
+
   contract-optimize:
     name: Optimize WASM
     needs: contract-check
@@ -82,23 +87,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
+      # Pinned toolchain for a reproducible release build. Keep in sync with
+      # the "Verifying the Deployed Contract" section of the README.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.81.0
         with:
           target: wasm32-unknown-unknown
           
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          
       - name: Build release
-        run: cargo build --target wasm32-unknown-unknown --release
+        run: |
+          RUSTFLAGS="-D warnings --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$GITHUB_WORKSPACE=/build" cargo build --locked --target wasm32-unknown-unknown --release
         
       - name: Install wasm-opt
         run: |
@@ -110,6 +108,11 @@ jobs:
           wasm-opt -Oz \
             target/wasm32-unknown-unknown/release/ai_agent_marketplace.wasm \
             -o target/wasm32-unknown-unknown/release/ai_agent_marketplace.opt.wasm
+
+      - name: Compute WASM hash
+        run: |
+          cd target/wasm32-unknown-unknown/release
+          sha256sum ai_agent_marketplace.opt.wasm | tee ai_agent_marketplace.opt.wasm.sha256
             
       - name: Check size
         run: |
@@ -119,11 +122,20 @@ jobs:
             echo "::warning::WASM exceeds 1MB"
           fi
           
+      # deploy-contract.sh verifies mainnet builds against this hash
+      # (EXPECTED_WASM_HASH).
+      - name: Record WASM hash
+        run: |
+          cd target/wasm32-unknown-unknown/release
+          sha256sum ai_agent_marketplace.opt.wasm | tee ai_agent_marketplace.opt.wasm.sha256
+
       - name: Upload WASM artifact
         uses: actions/upload-artifact@v4
         with:
           name: contract-wasm
-          path: target/wasm32-unknown-unknown/release/ai_agent_marketplace.opt.wasm
+          path: |
+            contracts/ai-agent-marketplace/target/wasm32-unknown-unknown/release/ai_agent_marketplace.opt.wasm
+            contracts/ai-agent-marketplace/target/wasm32-unknown-unknown/release/ai_agent_marketplace.opt.wasm.sha256
           retention-days: 7
 
   # ========== FRONTEND ==========
@@ -363,12 +375,37 @@ jobs:
           VITE_NETWORK_PASSPHRASE: ${{ secrets.VITE_NETWORK_PASSPHRASE }}
           VITE_USDC_CONTRACT_ID: ${{ secrets.VITE_USDC_CONTRACT_ID }}
 
-  deploy-production:
-    name: Deploy Production
+  # Secrets below resolve from the job's GitHub Environment, so `testnet` and
+  # `mainnet` each hold their own VERCEL_* / VITE_* values. The `mainnet`
+  # environment is configured with required reviewers, so its job waits for
+  # manual approval; `testnet` has no protection rules and deploys
+  # automatically.
+  deploy-testnet:
+    name: Deploy Testnet
     needs: [contract-optimize, frontend-build]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    environment: production
+    environment: testnet
+    steps:
+      - name: Deploy to Vercel Production
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          vercel-args: '--prod'
+        env:
+          VITE_CONTRACT_ID: ${{ secrets.VITE_CONTRACT_ID }}
+          VITE_RPC_URL: ${{ secrets.VITE_RPC_URL }}
+          VITE_NETWORK_PASSPHRASE: ${{ secrets.VITE_NETWORK_PASSPHRASE }}
+          VITE_USDC_CONTRACT_ID: ${{ secrets.VITE_USDC_CONTRACT_ID }}
+
+  deploy-mainnet:
+    name: Deploy Mainnet
+    needs: [contract-optimize, deploy-testnet]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: mainnet
     steps:
       - name: Deploy to Vercel Production
         uses: amondnet/vercel-action@v25
@@ -383,11 +420,28 @@ jobs:
           VITE_NETWORK_PASSPHRASE: ${{ secrets.VITE_NETWORK_PASSPHRASE }}
           VITE_USDC_CONTRACT_ID: ${{ secrets.VITE_USDC_CONTRACT_ID }}
           
+      - name: Download contract WASM
+        uses: actions/download-artifact@v4
+        with:
+          name: contract-wasm
+          path: contract-wasm
+
+      - name: Read WASM hash
+        id: wasm
+        run: echo "sha256=$(cut -d' ' -f1 contract-wasm/ai_agent_marketplace.opt.wasm.sha256)" >> $GITHUB_OUTPUT
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: v${{ github.run_number }}
           name: Release v${{ github.run_number }}
+          body: |
+            **Contract WASM SHA-256:** `${{ steps.wasm.outputs.sha256 }}`
+
+            Built in CI with Rust 1.81.0 and binaryen version_115. See the README section "Verifying the Deployed Contract" to reproduce and compare against the on-chain contract.
+          files: |
+            contract-wasm/ai_agent_marketplace.opt.wasm
+            contract-wasm/ai_agent_marketplace.opt.wasm.sha256
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

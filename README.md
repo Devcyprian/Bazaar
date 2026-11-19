@@ -536,11 +536,13 @@ Soroban RPC or Freighter wallet is required. Run in any environment.
 
 ### Production Checklist
 
-- [ ] Audit smart contract (recommended: Trail of Bits, Certora)
+- [ ] Audit smart contract (recommended: Trail of Bits, Certora) ([audit package & report](docs/audit/README.md))
 - [ ] Deploy to mainnet with multisig admin
+- [ ] Follow the [key management runbook](docs/mainnet/key-management.md) — mainnet admin key never stored in CI
 - [ ] Configure USDC mainnet contract ID
 - [ ] Set production RPC endpoints
 - [ ] Schedule `scripts/keeper.sh` (cron) to bump TTL of open escrows
+- [ ] Run `./scripts/smoke-test.sh mainnet <test-account>` after deploy and confirm it reports PASSED
 - [ ] Configure domain & SSL
 - [ ] Set up monitoring (Sentry, Datadog)
 - [ ] Load test with k6
@@ -549,22 +551,68 @@ Soroban RPC or Freighter wallet is required. Run in any environment.
 - [ ] Legal sign-off on sanctions/region restrictions ([record](docs/compliance/legal-signoff.md))
 - [ ] Review [incident runbook](docs/incidents/runbook.md) and confirm status page
 
+### CI/CD Environments
+
+The `main` branch pipeline deploys through two GitHub Environments
+(Settings → Environments):
+
+| Environment | Job | Protection | Secrets |
+|-------------|-----|------------|---------|
+| `testnet` | `deploy-testnet` | None — deploys automatically on push to `main` | Testnet `VERCEL_*` / `VITE_*` values |
+| `mainnet` | `deploy-mainnet` | Required reviewers — waits for manual approval | Mainnet `VERCEL_*` / `VITE_*` values |
+
+Store deploy secrets as environment secrets (not repository secrets) so each
+network only sees its own values. `deploy-mainnet` runs only after
+`deploy-testnet` succeeds.
+
 ### Deploy Contract (Mainnet)
+
+> Mainnet admin and deploy keys must be held on hardware wallets / KMS as described in
+> [`docs/mainnet/key-management.md`](docs/mainnet/key-management.md), not as plain CLI identities.
 
 ```bash
 # Use multisig for admin
 stellar keys generate --global multisig-admin --network mainnet
 
-# Deploy with stellar-cli
-stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/ai_agent_marketplace.opt.wasm \
-  --source-account multisig-admin \
-  --network mainnet \
-  --alias ai-agent-marketplace-mainnet
+# Deploy (requires the explicit flag, a typed confirmation, and the
+# SHA-256 from the CI `contract-wasm` artifact's .sha256 file).
+# A log is saved to deployments/deploy-mainnet-<timestamp>.log
+EXPECTED_WASM_HASH=<sha256-from-ci> ./scripts/deploy-contract.sh mainnet multisig-admin --i-understand-this-is-mainnet
 
 # Initialize with production config
 ./scripts/init-contract.sh mainnet
 ```
+
+### Verifying the Deployed Contract
+
+The release WASM is built in CI (`contract-optimize` job) with a pinned
+toolchain — Rust **1.81.0**, `cargo build --locked`, binaryen **version_115**
+`wasm-opt -Oz` — and its SHA-256 is published in each GitHub Release
+together with the `.wasm` file.
+
+To verify that the mainnet contract matches the source:
+
+```bash
+# 1. Check out the release tag and rebuild with the same toolchain
+git checkout v<N>
+rustup toolchain install 1.81.0 --target wasm32-unknown-unknown
+cd contracts/ai-agent-marketplace
+RUSTFLAGS="-D warnings --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$(cd ../.. && pwd)=/build" \
+  cargo +1.81.0 build --locked --target wasm32-unknown-unknown --release
+wasm-opt -Oz \
+  target/wasm32-unknown-unknown/release/ai_agent_marketplace.wasm \
+  -o target/wasm32-unknown-unknown/release/ai_agent_marketplace.opt.wasm
+sha256sum target/wasm32-unknown-unknown/release/ai_agent_marketplace.opt.wasm
+
+# 2. Fetch the WASM actually deployed on mainnet and hash it
+stellar contract fetch --id <CONTRACT_ID> --network mainnet -o deployed.wasm
+sha256sum deployed.wasm
+```
+
+Both hashes must equal the SHA-256 in the release notes. The on-chain WASM
+hash of a Soroban contract is the SHA-256 of the uploaded WASM, so the
+release hash also matches what `scripts/deploy-contract.sh` verifies after
+deploy.
 
 ### Deploy Frontend
 
@@ -662,6 +710,33 @@ Legal review of the sanctions screening and region restriction policy is
 tracked in [`docs/compliance/legal-signoff.md`](docs/compliance/legal-signoff.md).
 The sign-off record must be updated before enabling restrictions on mainnet.
 
+### Fiat On-Ramp & Off-Ramp (SEP-24)
+
+New users can buy USDC on Stellar and cash it out through a
+[SEP-24](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0024.md)
+anchor. When `VITE_ENABLE_FIAT_RAMP=true`, the wallet menu shows
+**Deposit USDC** and **Withdraw USDC**, which authenticate with the anchor via
+SEP-10 and open the anchor's interactive flow in a popup.
+
+| Network | Anchor (`VITE_SEP24_ANCHOR_DOMAIN`) |
+|---------|-------------------------------------|
+| Testnet | `testanchor.stellar.org` (SDF test anchor, default) |
+| Mainnet | A licensed USDC anchor the operator has a commercial agreement with |
+
+Compliance notes:
+
+- **KYC/AML is performed by the anchor.** Identity verification, bank details
+  and transaction monitoring happen inside the anchor's interactive UI; the
+  marketplace never collects or stores this data.
+- **The marketplace does not custody fiat or USDC.** Deposits go straight to
+  the user's wallet, and withdrawals are payments the user signs to the anchor.
+- **Anchor coverage limits availability.** Supported countries, payment rails,
+  limits and fees are set by the anchor and are shown in its flow.
+- **The SEP-10 challenge is verified** against the anchor's `SIGNING_KEY`
+  from its `stellar.toml` before the user is asked to sign it.
+- **Mainnet enablement requires legal sign-off** on the chosen anchor, recorded
+  alongside the sanctions sign-off above, before the feature flag is turned on.
+
 ---
 
 ## 🧪 Mainnet Rehearsal Report
@@ -718,6 +793,10 @@ owners and due dates.
 ---
 
 ## 🔐 Security
+
+See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for fund flows, trust assumptions, admin capabilities and mitigations.
+
+**External audit:** the audit package, findings tracker and final report are in [`docs/audit/`](docs/audit/README.md).
 
 ### Smart Contract
 =======

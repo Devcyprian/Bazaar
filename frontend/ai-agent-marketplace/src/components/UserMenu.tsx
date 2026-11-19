@@ -3,9 +3,11 @@ import { useWallet } from '../contexts/WalletContext';
 import { useProfile } from '../hooks/useProfile';
 import { Button } from './ui/Button';
 import { Link } from 'react-router-dom';
+import { Networks } from '@stellar/stellar-sdk';
+import { getSep24InteractiveUrl, isFiatRampEnabled, type Sep24Kind } from '../lib/sep24';
 
 export const UserMenu: React.FC = () => {
-  const { publicKey, disconnect } = useWallet();
+  const { publicKey, disconnect, network, signTransaction } = useWallet();
   const { profile } = useProfile(publicKey);
   const [isOpen, setIsOpen] = useState(false);
 
@@ -18,6 +20,23 @@ export const UserMenu: React.FC = () => {
    * truncated public key so the button always has a meaningful label.
    */
   const displayLabel = profile.displayName.trim() || shortAddr;
+
+  /** Open the anchor's SEP-24 interactive deposit / withdraw flow in a popup. */
+  const startFiatRamp = async (kind: Sep24Kind) => {
+    if (!publicKey) return;
+    // Open the popup synchronously so it isn't blocked, then point it at the anchor.
+    const popup = window.open('', 'sep24', 'width=500,height=800');
+    try {
+      const passphrase = network === 'PUBLIC' ? Networks.PUBLIC : Networks.TESTNET;
+      const url = await getSep24InteractiveUrl(kind, publicKey, passphrase, signTransaction);
+      if (popup) popup.location.href = url;
+      else window.open(url, '_blank');
+    } catch (err) {
+      popup?.close();
+      console.error(`SEP-24 ${kind} failed:`, err);
+      alert(err instanceof Error ? err.message : `Failed to start ${kind}.`);
+    }
+  };
 
   return (
     <div className="relative">
@@ -58,6 +77,24 @@ export const UserMenu: React.FC = () => {
           >
             ⚙️ Settings
           </Link>
+          {isFiatRampEnabled && (
+            <>
+              <button
+                role="menuitem"
+                onClick={() => startFiatRamp('deposit')}
+                className="w-full text-left px-3 py-2 text-sm rounded-lg hover:bg-accent transition-colors"
+              >
+                💵 Deposit USDC
+              </button>
+              <button
+                role="menuitem"
+                onClick={() => startFiatRamp('withdraw')}
+                className="w-full text-left px-3 py-2 text-sm rounded-lg hover:bg-accent transition-colors"
+              >
+                🏦 Withdraw USDC
+              </button>
+            </>
+          )}
           <hr className="my-1 border-border" />
           <button
             role="menuitem"
