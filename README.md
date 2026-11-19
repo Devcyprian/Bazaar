@@ -536,7 +536,7 @@ Soroban RPC or Freighter wallet is required. Run in any environment.
 
 ### Production Checklist
 
-- [ ] Audit smart contract (recommended: Trail of Bits, Certora)
+- [ ] Audit smart contract (recommended: Trail of Bits, Certora) ([audit package & report](docs/audit/README.md))
 - [ ] Deploy to mainnet with multisig admin
 - [ ] Configure USDC mainnet contract ID
 - [ ] Set production RPC endpoints
@@ -718,6 +718,8 @@ owners and due dates.
 ## 🔐 Security
 
 See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for fund flows, trust assumptions, admin capabilities and mitigations.
+
+**External audit:** the audit package, findings tracker and final report are in [`docs/audit/`](docs/audit/README.md).
 
 ### Smart Contract
 =======
