@@ -222,6 +222,9 @@ pub struct Config {
     /// Running total of funds currently locked in funded escrows.  Maintained
     /// alongside escrow state transitions so the cap can be enforced.
     pub total_locked_escrow: i128,
+    /// #129: Maximum number of bids a single job may accumulate.  Bounds the
+    /// cost of `accept_bid`, which must mark every other bid as Rejected.
+    pub max_bids_per_job: u32,
 }
 
 #[contracttype]
@@ -399,6 +402,14 @@ impl AiAgentMarketplace {
             return Err(Error::InvalidConfig);
         }
 
+        // #132: Verify the configured token is a 7-decimal Stellar Asset
+        // Contract.  All amounts in this contract assume USDC's 7 decimals.
+        let token_client = TokenClient::new(&env, &usdc_token);
+        let decimals = token_client.decimals();
+        if decimals != USDC_DECIMALS {
+            return Err(Error::InvalidToken);
+        }
+
         // Canary defaults: cap a single job at 10_000 USDC and total locked
         // escrow at 100_000 USDC (7 decimals).  Admins raise these in stages
         // via `set_max_job_budget` / `set_max_total_escrow`.
@@ -424,6 +435,7 @@ impl AiAgentMarketplace {
             max_job_budget,
             max_total_escrow,
             total_locked_escrow: 0,
+            max_bids_per_job: DEFAULT_MAX_BIDS_PER_JOB,
         };
 
         env.storage().instance().set(&DataKey::Config, &config);
@@ -1028,6 +1040,12 @@ impl AiAgentMarketplace {
             }
         }
 
+        // #129: Cap the number of bids per job so that `accept_bid`'s loop
+        // over the job's bids stays bounded.
+        if existing_bids.len() >= config.max_bids_per_job {
+            return Err(Error::TooManyBids);
+        }
+
         // Check bid amount
         if amount < job.budget / 2 {
             // Minimum 50% of budget
@@ -1166,15 +1184,13 @@ impl AiAgentMarketplace {
             return Err(Error::InsufficientEscrowBalance);
         }
 
-        // Transfer USDC from client to escrow.
-        //
-        // Reentrancy: Soroban token transfers do not re-enter this contract
-        // (the token contract is a separate invocation and cannot call back
-        // into us mid-transfer).  All persistent state below is written only
-        // after the transfer returns successfully, so a panicking/failing
-        // transfer leaves no partial state behind.
-        let usdc_client = TokenClient::new(&env, &config.usdc_token);
-        usdc_client.transfer(&client, &env.current_contract_address(), &escrow_amount);
+        // ===== CHECKS-EFFECTS-INTERACTIONS =====
+        // All validation above; all state writes below; token transfers last.
+        // A panicking/failing token contract therefore leaves no partial state
+        // (the whole invocation reverts, and no state was written before the
+        // external calls).
+
+        // ----- Effects: write all state before any external call -----
 
         // Create escrow
         let escrow_id = Self::next_escrow_id(&env)?;
@@ -1210,7 +1226,7 @@ impl AiAgentMarketplace {
         bid.status = BidStatus::Accepted;
         env.storage().instance().set(&DataKey::Bid(bid_id), &bid);
 
-        // Reject other bids
+        // Reject other bids.  #129: bounded by config.max_bids_per_job.
         for other_bid_id in job_bids.iter() {
             if *other_bid_id != bid_id {
                 let mut other_bid = Self::get_bid(&env, other_bid_id)?;
@@ -1238,13 +1254,15 @@ impl AiAgentMarketplace {
         updated_config.total_locked_escrow += escrow_amount;
         env.storage().instance().set(&DataKey::Config, &updated_config);
 
-        // Transfer platform fee to recipient.  State above is already
-        // committed; if this transfer fails the whole invocation reverts.
-        usdc_client.transfer(
-            &env.current_contract_address(),
-            &config.platform_fee_recipient,
-            &platform_fee,
-        );
+        // ----- Interactions: two direct transfers, fee moved only once -----
+        // #130: transfer the fee directly from the client to the recipient and
+        // the bid amount directly from the client into escrow, instead of
+        // pulling bid+fee in and pushing the fee back out.
+        let usdc_client = TokenClient::new(&env, &config.usdc_token);
+        if platform_fee > 0 {
+            usdc_client.transfer(&client, &config.platform_fee_recipient, &platform_fee);
+        }
+        usdc_client.transfer(&client, &env.current_contract_address(), &bid.amount);
 
         env.events().publish(
             (symbol_short!("bid_accept"), job_id, bid.agent.clone()),
@@ -1323,19 +1341,10 @@ impl AiAgentMarketplace {
             return Err(Error::EscrowNotFunded);
         }
 
-        // Release payment to agent.  #169: if the agent cannot receive USDC
-        // (missing trustline), record a claimable balance instead of trapping
-        // the funds in escrow.  The agent withdraws it later via `claim_funds`.
-        let usdc_client = TokenClient::new(&env, &config.usdc_token);
-        if Self::is_payable(&env, &config.usdc_token, &escrow.agent) {
-            usdc_client.transfer(
-                &env.current_contract_address(),
-                &escrow.agent,
-                &escrow.amount,
-            );
-        } else {
-            Self::record_claimable(&env, job_id, &escrow.agent, escrow.amount, &config.usdc_token);
-        }
+        // ===== CHECKS-EFFECTS-INTERACTIONS =====
+        // All validation above; all state writes below; token transfers last.
+
+        // ----- Effects: write all state before any external call -----
 
         // Update escrow
         escrow.status = EscrowStatus::Released;
@@ -1367,6 +1376,21 @@ impl AiAgentMarketplace {
         stats.avg_job_completion_time = (stats.avg_job_completion_time * stats.total_jobs + 
             (env.ledger().timestamp() - job.created_at)) / (stats.total_jobs + 1);
         env.storage().instance().set(&DataKey::PlatformStats, &stats);
+
+        // ----- Interactions: release payment to agent -----
+        // #169: if the agent cannot receive USDC (missing trustline), record a
+        // claimable balance instead of trapping the funds in escrow.  The agent
+        // withdraws it later via `claim_funds`.
+        let usdc_client = TokenClient::new(&env, &config.usdc_token);
+        if Self::is_payable(&env, &config.usdc_token, &escrow.agent) {
+            usdc_client.transfer(
+                &env.current_contract_address(),
+                &escrow.agent,
+                &escrow.amount,
+            );
+        } else {
+            Self::record_claimable(&env, job_id, &escrow.agent, escrow.amount, &config.usdc_token);
+        }
 
         env.events().publish(
             (symbol_short!("approved"), job_id, escrow.agent.clone()),
@@ -1511,31 +1535,24 @@ impl AiAgentMarketplace {
             .ok_or(Error::EscrowNotFound)?;
         let mut escrow = Self::get_escrow(&env, escrow_id)?;
 
-        let usdc_client = TokenClient::new(&env, &config.usdc_token);
-
         // Deduct the (higher) dispute fee from the escrow payout.
         let dispute_fee = (escrow.amount * config.platform_fee_bps_dispute as i128) / 10000;
         let payout = escrow.amount - dispute_fee;
-        if dispute_fee > 0 {
-            usdc_client.transfer(
-                &env.current_contract_address(),
-                &config.platform_fee_recipient,
-                &dispute_fee,
-            );
-        }
 
-        match resolution.as_str() {
+        // ===== CHECKS-EFFECTS-INTERACTIONS =====
+        // All validation above; all state writes below; token transfers last.
+
+        // ----- Effects: write all state before any external call -----
+        let (agent_payout, client_payout) = match resolution.as_str() {
             "agent" => {
-                // Full payment to agent (minus dispute fee)
-                Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.agent, payout);
                 escrow.status = EscrowStatus::Released;
                 job.status = JobStatus::Completed;
+                (payout, 0)
             }
             "client" => {
-                // Full refund to client (minus dispute fee)
-                Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.client, payout);
                 escrow.status = EscrowStatus::Refunded;
                 job.status = JobStatus::Refunded;
+                (0, payout)
             }
             "split" => {
                 let percentage = split_percentage.unwrap_or(50);
@@ -1544,14 +1561,12 @@ impl AiAgentMarketplace {
                 }
                 let agent_amount = (payout * percentage as i128) / 100;
                 let client_amount = payout - agent_amount;
-
-                Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.agent, agent_amount);
-                Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.client, client_amount);
                 escrow.status = EscrowStatus::Released;
                 job.status = JobStatus::Completed;
+                (agent_amount, client_amount)
             }
             _ => return Err(Error::InvalidConfig),
-        }
+        };
 
         escrow.resolver = Some(resolver.clone());
         escrow.released_at = Some(env.ledger().timestamp());
@@ -1569,6 +1584,18 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::Dispute(dispute_id), &dispute);
 
         env.storage().instance().set(&DataKey::Job(dispute.job_id), &job);
+
+        // ----- Interactions: token transfers last -----
+        let usdc_client = TokenClient::new(&env, &config.usdc_token);
+        if dispute_fee > 0 {
+            usdc_client.transfer(
+                &env.current_contract_address(),
+                &config.platform_fee_recipient,
+                &dispute_fee,
+            );
+        }
+        Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.agent, agent_payout);
+        Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.client, client_payout);
 
         env.events().publish(
             (symbol_short!("dispute_res"), dispute.job_id, resolver.clone()),
@@ -1736,16 +1763,10 @@ impl AiAgentMarketplace {
             return Err(Error::EscrowExpired);
         }
 
-        // Transfer the escrowed amount back to the client.
-        //
-        // Reentrancy: token transfers cannot re-enter this contract; all state
-        // writes below occur only after the transfer succeeds.
-        let usdc_client = TokenClient::new(&env, &config.usdc_token);
-        usdc_client.transfer(
-            &env.current_contract_address(),
-            &client,
-            &escrow.amount,
-        );
+        // ===== CHECKS-EFFECTS-INTERACTIONS =====
+        // All validation above; all state writes below; token transfers last.
+
+        // ----- Effects: write all state before any external call -----
 
         // Update escrow state
         escrow.status = EscrowStatus::Refunded;
@@ -1761,6 +1782,14 @@ impl AiAgentMarketplace {
         // Update job state
         job.status = JobStatus::Refunded;
         env.storage().instance().set(&DataKey::Job(job_id), &job);
+
+        // ----- Interactions: transfer the escrowed amount back to the client -----
+        let usdc_client = TokenClient::new(&env, &config.usdc_token);
+        usdc_client.transfer(
+            &env.current_contract_address(),
+            &client,
+            &escrow.amount,
+        );
 
         // Emit refund event
         env.events().publish(
@@ -1814,13 +1843,10 @@ impl AiAgentMarketplace {
             return Err(Error::EscrowNotFunded);
         }
 
-        let usdc_client = TokenClient::new(&env, &config.usdc_token);
-        usdc_client.transfer(
-            &env.current_contract_address(),
-            &client,
-            &escrow.amount,
-        );
+        // ===== CHECKS-EFFECTS-INTERACTIONS =====
+        // All validation above; all state writes below; token transfers last.
 
+        // ----- Effects: write all state before any external call -----
         escrow.status = EscrowStatus::Refunded;
         escrow.released_at = Some(env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
@@ -1828,6 +1854,14 @@ impl AiAgentMarketplace {
         job.status = JobStatus::Refunded;
         env.storage().instance().set(&DataKey::Job(job_id), &job);
         Self::extend_instance_ttl(&env);
+
+        // ----- Interactions: transfer the escrowed amount back to the client -----
+        let usdc_client = TokenClient::new(&env, &config.usdc_token);
+        usdc_client.transfer(
+            &env.current_contract_address(),
+            &client,
+            &escrow.amount,
+        );
 
         env.events().publish(
             (symbol_short!("reclaim"), job_id, client.clone()),
@@ -1859,15 +1893,20 @@ impl AiAgentMarketplace {
             return Err(Error::AgentNotPayable);
         }
 
+        // ===== CHECKS-EFFECTS-INTERACTIONS =====
+        // All validation above; all state writes below; token transfers last.
+
+        // ----- Effects: write all state before any external call -----
+        env.storage().instance().remove(&DataKey::Claimable(job_id));
+        Self::extend_instance_ttl(&env);
+
+        // ----- Interactions: transfer the claimable amount to the recipient -----
         let usdc_client = TokenClient::new(&env, &claim.token);
         usdc_client.transfer(
             &env.current_contract_address(),
             &agent,
             &claim.amount,
         );
-
-        env.storage().instance().remove(&DataKey::Claimable(job_id));
-        Self::extend_instance_ttl(&env);
 
         env.events().publish(
             (symbol_short!("claim"), job_id, agent.clone()),
@@ -1920,24 +1959,16 @@ impl AiAgentMarketplace {
             return Err(Error::EscrowNotDisputed);
         }
 
-        let usdc_client = TokenClient::new(&env, &config.usdc_token);
-
         let dispute_fee = (escrow.amount * config.platform_fee_bps_dispute as i128) / 10000;
         let payout = escrow.amount - dispute_fee;
-        if dispute_fee > 0 {
-            usdc_client.transfer(
-                &env.current_contract_address(),
-                &config.platform_fee_recipient,
-                &dispute_fee,
-            );
-        }
 
         let agent_amount = (payout * DISPUTE_FALLBACK_AGENT_PCT as i128) / 100;
         let client_amount = payout - agent_amount;
 
-        Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.agent, agent_amount);
-        Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.client, client_amount);
+        // ===== CHECKS-EFFECTS-INTERACTIONS =====
+        // All validation above; all state writes below; token transfers last.
 
+        // ----- Effects: write all state before any external call -----
         escrow.status = EscrowStatus::Released;
         escrow.released_at = Some(env.ledger().timestamp());
         escrow.resolver = Some(caller.clone());
@@ -1951,6 +1982,18 @@ impl AiAgentMarketplace {
         job.status = JobStatus::Completed;
         env.storage().instance().set(&DataKey::Job(dispute.job_id), &job);
         Self::extend_instance_ttl(&env);
+
+        // ----- Interactions: token transfers last -----
+        let usdc_client = TokenClient::new(&env, &config.usdc_token);
+        if dispute_fee > 0 {
+            usdc_client.transfer(
+                &env.current_contract_address(),
+                &config.platform_fee_recipient,
+                &dispute_fee,
+            );
+        }
+        Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.agent, agent_amount);
+        Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.client, client_amount);
 
         env.events().publish(
             (symbol_short!("disp_fb"), dispute.job_id, caller.clone()),

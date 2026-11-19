@@ -76,6 +76,7 @@ fn create_marketplace_contract<'a>(
         &false,         // require_skill_verification (off by default)
         &1_000_000_000, // max_job_budget (1000 USDC)
         &10_000_000_000, // max_total_escrow (10000 USDC)
+        &50,            // max_bids_per_job (#129)
     );
 
     client
