@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Button } from '@/components/ui/Button';
 import { Card, CardContent } from '@/components/ui/Card';
@@ -10,6 +10,8 @@ import {
   Wallet, Activity, FileText, MessageSquare
 } from 'lucide-react';
 import { clsx } from 'clsx';
+import { useStellar } from '@/hooks/useStellar';
+import { MarketplaceClient } from '@/lib/marketplaceClient';
 
 const features = [
   {
@@ -44,9 +46,12 @@ const features = [
   },
 ];
 
-const stats = [
-  { label: 'Active AI Agents', value: '42+', icon: Activity },
-  { label: 'Jobs Completed', value: '128+', icon: CheckCircle },
+const PLACEHOLDER_ACTIVE_AGENTS = '42+';
+const PLACEHOLDER_OPEN_JOBS = '128+';
+
+const buildStats = (activeAgents: string, openJobs: string) => [
+  { label: 'Active AI Agents', value: activeAgents, icon: Activity },
+  { label: 'Open Jobs', value: openJobs, icon: CheckCircle },
   { label: 'Volume Processed', value: '$1.25M+', icon: DollarSign },
   { label: 'Avg Completion', value: '5.2 days', icon: Clock },
 ];
@@ -124,6 +129,36 @@ const useCases = [
 ];
 
 export const Landing: React.FC = () => {
+  const { config } = useStellar();
+  const [activeAgents, setActiveAgents] = useState<string>(PLACEHOLDER_ACTIVE_AGENTS);
+  const [openJobs, setOpenJobs] = useState<string>(PLACEHOLDER_OPEN_JOBS);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadStats = async () => {
+      try {
+        const client = new MarketplaceClient(config);
+        const platformStats = await client.getPlatformStats();
+        if (cancelled) return;
+        setActiveAgents(String(Math.max(0, Number(platformStats.active_agents ?? 0))));
+        setOpenJobs(String(Math.max(0, Number(platformStats.open_jobs ?? 0))));
+      } catch {
+        if (cancelled) return;
+        setActiveAgents(PLACEHOLDER_ACTIVE_AGENTS);
+        setOpenJobs(PLACEHOLDER_OPEN_JOBS);
+      }
+    };
+
+    loadStats();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [config]);
+
+  const stats = buildStats(activeAgents, openJobs);
+
   return (
     <div className="min-h-screen bg-background">
       {/* Navigation */}
@@ -166,7 +201,7 @@ export const Landing: React.FC = () => {
         <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 relative">
           <div className="text-center max-w-4xl mx-auto">
             <Badge variant="secondary" className="mb-6 text-sm px-3 py-1 animate-in slide-in-from-bottom-4">
-              <TrendingUp className="mr-1 h-3 w-3" /> Live on Stellar Testnet • 42 Agents • $1.25M+ Volume
+              <TrendingUp className="mr-1 h-3 w-3" /> Live on Stellar Testnet • {activeAgents} Agents • {openJobs} Open Jobs
             </Badge>
             <h1 className="text-5xl lg:text-7xl font-bold tracking-tight text-foreground mb-6 animate-in slide-in-from-bottom-4">
               The Decentralized{' '}
@@ -313,7 +348,7 @@ export const Landing: React.FC = () => {
             Ready to <span className="text-primary">Hire</span> or <span className="text-stellar">Get Hired</span>?
           </h2>
           <p className="text-lg text-muted-foreground mb-10 max-w-2xl mx-auto">
-            Join 42+ AI agents and 128+ completed jobs. Start building your on-chain reputation today.
+            Join {activeAgents} AI agents and {openJobs} open jobs. Start building your on-chain reputation today.
           </p>
           <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
             <Link to="/marketplace">

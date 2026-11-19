@@ -253,6 +253,10 @@ pub struct PlatformStats {
     pub total_fees_collected: i128,
     pub total_disputes: u64,
     pub avg_job_completion_time: u64,
+    /// #128: Number of jobs currently in `JobStatus::Open`.
+    pub open_jobs: u32,
+    /// #128: Number of agents whose `is_active` flag is `true`.
+    pub active_agents: u32,
 }
 
 #[contracterror]
@@ -321,6 +325,11 @@ pub enum Error {
     /// Returned by `post_job` / `place_bid` when the caller's address is on the
     /// admin-managed sanctions/denylist.
     AddressBlocked = 53,
+    /// Returned by `leave_review` when the comment exceeds
+    /// `MAX_REVIEW_COMMENT_LEN` bytes.
+    InputTooLong = 54,
+    /// Returned by `place_bid` when the bidding agent has been deactivated.
+    AgentInactive = 55,
 }
 
 /// #172: Minimum TTL (in ledgers) we keep on persistent records.  At ~5s per
@@ -336,6 +345,11 @@ pub const EXTEND_INSTANCE_TTL: u32 = 1_555_200;
 /// #170: Default fallback split (percentage of payout to the agent) applied
 /// when a dispute times out without an admin resolution.
 pub const DISPUTE_FALLBACK_AGENT_PCT: u32 = 50;
+/// #124: Maximum length, in bytes, of the free-form `comment` accepted by
+/// `leave_review`.  Comments are stored on chain forever, so this cap bounds
+/// the storage cost per review.  Longer comments are rejected with
+/// `Error::InputTooLong`.
+pub const MAX_REVIEW_COMMENT_LEN: u32 = 500;
 
 #[contract]
 pub struct AiAgentMarketplace;
@@ -411,6 +425,8 @@ impl AiAgentMarketplace {
             total_fees_collected: 0,
             total_disputes: 0,
             avg_job_completion_time: 0,
+            open_jobs: 0,
+            active_agents: 0,
         };
         env.storage().instance().set(&DataKey::PlatformStats, &stats);
         env.storage().instance().set(&DataKey::IsPaused, &false);
@@ -580,10 +596,11 @@ impl AiAgentMarketplace {
         // Update stats
         let mut stats = Self::get_platform_stats(&env)?;
         stats.total_agents += 1;
+        stats.active_agents += 1;
         env.storage().instance().set(&DataKey::PlatformStats, &stats);
 
         env.events().publish(
-            (symbol_short!("agent_reg"),),
+            (symbol_short!("agent_reg"), agent_id, owner.clone()),
             (agent_id, owner, agent.price_per_task),
         );
 
@@ -624,6 +641,15 @@ impl AiAgentMarketplace {
             agent.price_per_task = price;
         }
         if let Some(active) = is_active {
+            if agent.is_active && !active {
+                let mut stats = Self::get_platform_stats(&env)?;
+                stats.active_agents = stats.active_agents.saturating_sub(1);
+                env.storage().instance().set(&DataKey::PlatformStats, &stats);
+            } else if !agent.is_active && active {
+                let mut stats = Self::get_platform_stats(&env)?;
+                stats.active_agents += 1;
+                env.storage().instance().set(&DataKey::PlatformStats, &stats);
+            }
             agent.is_active = active;
         }
         if let Some(uri) = metadata_uri {
@@ -633,8 +659,79 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::Agent(agent_id), &agent);
 
         env.events().publish(
-            (symbol_short!("agent_upd"),),
+            (symbol_short!("agent_upd"), agent_id, owner.clone()),
             (agent_id, owner),
+        );
+
+        Ok(())
+    }
+
+    /// #125: Deactivate an agent (owner only).
+    ///
+    /// Flips `agent.is_active` to `false`, which prevents the agent from
+    /// bidding on new jobs and hides it from skill indexes.  Jobs already in
+    /// progress are unaffected.  Emits an `agent_deact` event.
+    pub fn deactivate_agent(
+        env: Env,
+        owner: Address,
+        agent_id: u64,
+    ) -> Result<(), Error> {
+        owner.require_auth();
+        Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
+
+        let mut agent = Self::get_agent(&env, agent_id)?;
+        if agent.owner != owner {
+            return Err(Error::Unauthorized);
+        }
+
+        if agent.is_active {
+            agent.is_active = false;
+            env.storage().instance().set(&DataKey::Agent(agent_id), &agent);
+
+            let mut stats = Self::get_platform_stats(&env)?;
+            stats.active_agents = stats.active_agents.saturating_sub(1);
+            env.storage().instance().set(&DataKey::PlatformStats, &stats);
+        }
+
+        env.events().publish(
+            (symbol_short!("agent_deact"), agent_id, owner.clone()),
+            (agent_id, owner, agent.is_active),
+        );
+
+        Ok(())
+    }
+
+    /// #125: Reactivate an agent (owner only).
+    ///
+    /// Flips `agent.is_active` back to `true`, allowing the agent to bid again
+    /// and reappear in skill indexes.  Emits an `agent_react` event.
+    pub fn reactivate_agent(
+        env: Env,
+        owner: Address,
+        agent_id: u64,
+    ) -> Result<(), Error> {
+        owner.require_auth();
+        Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
+
+        let mut agent = Self::get_agent(&env, agent_id)?;
+        if agent.owner != owner {
+            return Err(Error::Unauthorized);
+        }
+
+        if !agent.is_active {
+            agent.is_active = true;
+            env.storage().instance().set(&DataKey::Agent(agent_id), &agent);
+
+            let mut stats = Self::get_platform_stats(&env)?;
+            stats.active_agents += 1;
+            env.storage().instance().set(&DataKey::PlatformStats, &stats);
+        }
+
+        env.events().publish(
+            (symbol_short!("agent_react"), agent_id, owner.clone()),
+            (agent_id, owner, agent.is_active),
         );
 
         Ok(())
@@ -712,7 +809,7 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::SkillVerificationsByAgent(agent.owner.clone()), &agent_verifications);
 
         env.events().publish(
-            (symbol_short!("skill_ver"),),
+            (symbol_short!("skill_ver"), agent_id, verifier.clone()),
             (agent_id, skill, verifier, expires_at),
         );
 
@@ -786,10 +883,11 @@ impl AiAgentMarketplace {
         // Update stats
         let mut stats = Self::get_platform_stats(&env)?;
         stats.total_jobs += 1;
+        stats.open_jobs += 1;
         env.storage().instance().set(&DataKey::PlatformStats, &stats);
 
         env.events().publish(
-            (symbol_short!("job_post"),),
+            (symbol_short!("job_post"), job_id, client.clone()),
             (job_id, client, budget, deadline),
         );
 
@@ -826,8 +924,12 @@ impl AiAgentMarketplace {
         job.status = JobStatus::Cancelled;
         env.storage().instance().set(&DataKey::Job(job_id), &job);
 
+        let mut stats = Self::get_platform_stats(&env)?;
+        stats.open_jobs = stats.open_jobs.saturating_sub(1);
+        env.storage().instance().set(&DataKey::PlatformStats, &stats);
+
         env.events().publish(
-            (symbol_short!("job_cancel"),),
+            (symbol_short!("job_cancel"), job_id, client.clone()),
             (job_id, client),
         );
 
@@ -870,7 +972,7 @@ impl AiAgentMarketplace {
         let agent = Self::get_agent(&env, agent_id)?;
 
         if !agent.is_active {
-            return Err(Error::AgentNotActive);
+            return Err(Error::AgentInactive);
         }
 
         if agent.reputation < config.min_agent_reputation_to_bid {
@@ -941,7 +1043,7 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::BidsByAgent(agent_owner.clone()), &agent_bids);
 
         env.events().publish(
-            (symbol_short!("bid_placed"),),
+            (symbol_short!("bid_placed"), job_id, agent_owner.clone()),
             (bid_id, job_id, agent_owner, amount),
         );
 
@@ -984,7 +1086,7 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::Bid(bid_id), &bid);
 
         env.events().publish(
-            (symbol_short!("bid_withdraw"),),
+            (symbol_short!("bid_withdraw"), job_id, agent_owner.clone()),
             (bid_id, job_id, agent_owner),
         );
 
@@ -1106,6 +1208,7 @@ impl AiAgentMarketplace {
         let mut stats = Self::get_platform_stats(&env)?;
         stats.total_volume += bid.amount;
         stats.total_fees_collected += platform_fee;
+        stats.open_jobs = stats.open_jobs.saturating_sub(1);
         env.storage().instance().set(&DataKey::PlatformStats, &stats);
 
         // Track the newly locked escrow against the canary cap.
@@ -1122,7 +1225,7 @@ impl AiAgentMarketplace {
         );
 
         env.events().publish(
-            (symbol_short!("bid_accept"),),
+            (symbol_short!("bid_accept"), job_id, bid.agent.clone()),
             (job_id, bid_id, bid.agent, bid.amount, platform_fee),
         );
 
@@ -1156,7 +1259,7 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::Job(job_id), &job);
 
         env.events().publish(
-            (symbol_short!("deliver"),),
+            (symbol_short!("deliver"), job_id, agent.clone()),
             (job_id, agent, deliverable_hash),
         );
 
@@ -1244,7 +1347,7 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::PlatformStats, &stats);
 
         env.events().publish(
-            (symbol_short!("approved"),),
+            (symbol_short!("approved"), job_id, escrow.agent.clone()),
             (job_id, escrow.agent, escrow.amount),
         );
 
@@ -1341,7 +1444,7 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::PlatformStats, &stats);
 
         env.events().publish(
-            (symbol_short!("dispute"),),
+            (symbol_short!("dispute"), job_id, raiser.clone()),
             (dispute_id, job_id, raiser, dispute.reason.clone()),
         );
 
@@ -1441,7 +1544,7 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::Job(dispute.job_id), &job);
 
         env.events().publish(
-            (symbol_short!("dispute_res"),),
+            (symbol_short!("dispute_res"), dispute.job_id, resolver.clone()),
             (dispute_id, resolver, resolution),
         );
 
@@ -1473,6 +1576,11 @@ impl AiAgentMarketplace {
 
         if rating < 1 || rating > 5 {
             return Err(Error::InvalidRating);
+        }
+
+        // #124: cap the comment length so reviews cannot bloat storage.
+        if comment.len() > MAX_REVIEW_COMMENT_LEN {
+            return Err(Error::InputTooLong);
         }
 
         // Check if already reviewed
@@ -1536,7 +1644,7 @@ impl AiAgentMarketplace {
         }
 
         env.events().publish(
-            (symbol_short!("review"),),
+            (symbol_short!("review"), job_id, reviewer.clone()),
             (review_id, job_id, reviewer, reviewee, rating),
         );
 
@@ -1626,7 +1734,7 @@ impl AiAgentMarketplace {
 
         // Emit refund event
         env.events().publish(
-            (symbol_short!("refund"),),
+            (symbol_short!("refund"), job_id, client.clone()),
             (job_id, client, escrow.amount),
         );
 
@@ -1692,7 +1800,7 @@ impl AiAgentMarketplace {
         Self::extend_instance_ttl(&env);
 
         env.events().publish(
-            (symbol_short!("reclaim"),),
+            (symbol_short!("reclaim"), job_id, client.clone()),
             (job_id, client, escrow.amount),
         );
 
@@ -1732,7 +1840,7 @@ impl AiAgentMarketplace {
         Self::extend_instance_ttl(&env);
 
         env.events().publish(
-            (symbol_short!("claim"),),
+            (symbol_short!("claim"), job_id, agent.clone()),
             (job_id, agent, claim.amount, config.usdc_token),
         );
 
@@ -1815,7 +1923,7 @@ impl AiAgentMarketplace {
         Self::extend_instance_ttl(&env);
 
         env.events().publish(
-            (symbol_short!("disp_fb"),),
+            (symbol_short!("disp_fb"), dispute.job_id, caller.clone()),
             (dispute_id, caller, agent_amount, client_amount),
         );
 
@@ -1839,7 +1947,7 @@ impl AiAgentMarketplace {
         }
 
         env.events().publish(
-            (symbol_short!("ttl_bump"),),
+            (symbol_short!("ttl_bump"), job_id),
             (job_id, env.ledger().sequence()),
         );
 
@@ -1974,7 +2082,16 @@ impl AiAgentMarketplace {
         let all: Vec<u64> = env.storage().instance()
             .get(&DataKey::SkillAgents(skill))
             .unwrap_or(Vec::new(&env));
-        Self::paginate(&env, &all, offset, limit)
+        // #125: hide deactivated agents from skill indexes.
+        let mut active = Vec::new(&env);
+        for id in all.iter() {
+            if let Ok(agent) = Self::get_agent(&env, id) {
+                if agent.is_active {
+                    active.push_back(id);
+                }
+            }
+        }
+        Self::paginate(&env, &active, offset, limit)
     }
 
     /// Get all agents (paginated).
@@ -2060,6 +2177,8 @@ impl AiAgentMarketplace {
             total_fees_collected: 0,
             total_disputes: 0,
             avg_job_completion_time: 0,
+            open_jobs: 0,
+            active_agents: 0,
         })
     }
 
@@ -2236,7 +2355,7 @@ impl AiAgentMarketplace {
         };
         env.storage().instance().set(&DataKey::Claimable(job_id), &claim);
         env.events().publish(
-            (symbol_short!("claimable"),),
+            (symbol_short!("claimable"), job_id),
             (job_id, recipient.clone(), amount),
         );
     }

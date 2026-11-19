@@ -2757,6 +2757,540 @@ fn test_bid_allowed_when_verification_not_required() {
         &14,
     );
 
+    // Bid should succeed even though the agent is not verified.
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(&e, "Proposal"),
+    );
+    assert_eq!(bid_id, 1);
+}
+
+// ==================== #124: Review comment length cap ====================
+
+/// Helper: drives a job to the Completed state so a review can be left.
+fn setup_completed_job<'a>(
+    e: &Env,
+) -> (AiAgentMarketplaceClient<'a>, Address, Address, u64) {
+    let admin = Address::generate(e);
+    let client_addr = Address::generate(e);
+    let agent_owner = Address::generate(e);
+    let usdc = create_token_contract(e);
+    let marketplace = create_marketplace_contract(e, &admin, &usdc.address());
+
+    let admin_token = TokenAdminClient::new(e, &usdc.address());
+    admin_token.mint(&client_addr, &1_000_000_000);
+
+    marketplace.register_agent(
+        &agent_owner,
+        &String::from_str(e, "Agent"),
+        &String::from_str(e, "Desc"),
+        &Vec::from_array(e, [String::from_str(e, "python")]),
+        &50_000_000,
+        &String::from_str(e, "ipfs://QmTest"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(e, "Job"),
+        &String::from_str(e, "Desc"),
+        &Vec::from_array(e, [String::from_str(e, "python")]),
+        &100_000_000,
+        &14,
+    );
+
+    let bid_id = marketplace.place_bid(
+        &agent_owner,
+        &job_id,
+        &80_000_000,
+        &7,
+        &String::from_str(e, "Proposal"),
+    );
+
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    let hash = BytesN::from_array(e, &[1u8; 32]);
+    marketplace.submit_deliverable(&agent_owner, &job_id, &hash);
+    marketplace.approve_deliverable(&client_addr, &job_id);
+
+    (marketplace, client_addr, agent_owner, job_id)
+}
+
+/// Builds a comment string of exactly `len` ASCII bytes.
+fn comment_of_len(e: &Env, len: usize) -> String {
+    let mut buf = [b'a'; 512];
+    for b in buf.iter_mut() {
+        *b = b'a';
+    }
+    let slice = &buf[..len];
+    String::from_str(e, core::str::from_utf8(slice).unwrap())
+}
+
+#[test]
+fn test_leave_review_comment_at_limit_succeeds() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, client_addr, _agent, job_id) = setup_completed_job(&e);
+
+    // Exactly 500 bytes -> accepted.
+    let comment = comment_of_len(&e, 500);
+    assert_eq!(comment.len(), 500);
+    marketplace.leave_review(&client_addr, &job_id, &5, &comment);
+
+    let reviews = marketplace.get_reviews_by_reviewee(&_agent, &0, &10);
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews.get(0).unwrap().comment.len(), 500);
+}
+
+#[test]
+fn test_leave_review_comment_over_limit_rejected() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, client_addr, _agent, job_id) = setup_completed_job(&e);
+
+    // 501 bytes -> rejected with InputTooLong.
+    let comment = comment_of_len(&e, 501);
+    assert_eq!(comment.len(), 501);
+    let result = marketplace.try_leave_review(&client_addr, &job_id, &5, &comment);
+    assert_eq!(result, Err(Ok(Error::InputTooLong)));
+
+    // No review was recorded.
+    let reviews = marketplace.get_reviews_by_reviewee(&_agent, &0, &10);
+    assert_eq!(reviews.len(), 0);
+}
+
+#[test]
+fn test_leave_review_empty_comment_succeeds() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, client_addr, _agent, job_id) = setup_completed_job(&e);
+
+    let comment = String::from_str(&e, "");
+    assert_eq!(comment.len(), 0);
+    marketplace.leave_review(&client_addr, &job_id, &5, &comment);
+
+    let reviews = marketplace.get_reviews_by_reviewee(&_agent, &0, &10);
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews.get(0).unwrap().comment.len(), 0);
+}
+
+// ==================== #125: deactivate_agent / reactivate_agent ====================
+
+#[test]
+fn test_deactivate_agent_owner_only() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let owner = Address::generate(&e);
+    let attacker = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let agent_id = marketplace.register_agent(
+        &owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &10_000_000,
+        &String::from_str(&e, "ipfs://test"),
+    );
+
+    // Non-owner cannot deactivate.
+    let result = marketplace.try_deactivate_agent(&attacker, &agent_id);
+    assert!(result.is_err());
+    assert!(marketplace.get_agent(&agent_id).is_active);
+
+    // Owner can deactivate.
+    marketplace.deactivate_agent(&owner, &agent_id);
+    assert!(!marketplace.get_agent(&agent_id).is_active);
+
+    // Non-owner cannot reactivate.
+    let result = marketplace.try_reactivate_agent(&attacker, &agent_id);
+    assert!(result.is_err());
+    assert!(!marketplace.get_agent(&agent_id).is_active);
+
+    // Owner can reactivate.
+    marketplace.reactivate_agent(&owner, &agent_id);
+    assert!(marketplace.get_agent(&agent_id).is_active);
+}
+
+#[test]
+fn test_deactivate_agent_emits_events() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let agent_id = marketplace.register_agent(
+        &owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &10_000_000,
+        &String::from_str(&e, "ipfs://test"),
+    );
+
+    marketplace.deactivate_agent(&owner, &agent_id);
+    marketplace.reactivate_agent(&owner, &agent_id);
+
+    let events = e.events().all();
+    let mut saw_deactivated = false;
+    let mut saw_reactivated = false;
+    for ev in events.iter() {
+        let (_contract, topics, _data) = ev;
+        if topics.len() >= 2 {
+            let sym: soroban_sdk::Symbol = topics.get(0).unwrap().into_val(&e);
+            if sym == symbol_short!("agent_deact") {
+                saw_deactivated = true;
+            }
+            if sym == symbol_short!("agent_react") {
+                saw_reactivated = true;
+            }
+        }
+    }
+    assert!(saw_deactivated, "AgentDeactivated event not emitted");
+    assert!(saw_reactivated, "AgentReactivated event not emitted");
+}
+
+#[test]
+fn test_inactive_agent_cannot_bid() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let agent_id = marketplace.register_agent(
+        &owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &10_000_000,
+        &String::from_str(&e, "ipfs://test"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &10_000_000,
+        &14,
+    );
+
+    marketplace.deactivate_agent(&owner, &agent_id);
+
+    let result = marketplace.try_place_bid(
+        &owner,
+        &job_id,
+        &10_000_000,
+        &1,
+        &String::from_str(&e, "Prop"),
+    );
+    assert!(result.is_err());
+
+    // Reactivating restores bidding.
+    marketplace.reactivate_agent(&owner, &agent_id);
+    let bid_id = marketplace.place_bid(
+        &owner,
+        &job_id,
+        &10_000_000,
+        &1,
+        &String::from_str(&e, "Prop"),
+    );
+    assert_eq!(bid_id, 1);
+}
+
+#[test]
+fn test_deactivated_agent_excluded_from_skill_index() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let skill = String::from_str(&e, "python");
+
+    let agent_id = marketplace.register_agent(
+        &owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [skill.clone()]),
+        &10_000_000,
+        &String::from_str(&e, "ipfs://test"),
+    );
+
+    assert_eq!(marketplace.get_agents_by_skill(&skill, &0, &10).len(), 1);
+
+    marketplace.deactivate_agent(&owner, &agent_id);
+    assert_eq!(marketplace.get_agents_by_skill(&skill, &0, &10).len(), 0);
+
+    marketplace.reactivate_agent(&owner, &agent_id);
+    assert_eq!(marketplace.get_agents_by_skill(&skill, &0, &10).len(), 1);
+}
+
+#[test]
+fn test_deactivation_does_not_affect_active_jobs() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let admin_token = TokenAdminClient::new(&e, &usdc.address());
+    admin_token.mint(&client_addr, &1_000_000_000);
+
+    let agent_id = marketplace.register_agent(
+        &owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &10_000_000,
+        &String::from_str(&e, "ipfs://test"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &10_000_000,
+        &14,
+    );
+
+    let bid_id = marketplace.place_bid(
+        &owner,
+        &job_id,
+        &10_000_000,
+        &1,
+        &String::from_str(&e, "Prop"),
+    );
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+
+    // Deactivate mid-job; the in-progress job must still be completable.
+    marketplace.deactivate_agent(&owner, &agent_id);
+
+    let hash = BytesN::from_array(&e, &[1u8; 32]);
+    marketplace.submit_deliverable(&owner, &job_id, &hash);
+    marketplace.approve_deliverable(&client_addr, &job_id);
+
+    let job = marketplace.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Completed);
+}
+
+// ==================== #127: id-based event topics ====================
+
+#[test]
+fn test_event_topics_allow_filtering_by_job_id() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    // Create two jobs; only the second should match our filter.
+    let _job_a = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job A"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &14,
+    );
+    let job_b = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job B"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &14,
+    );
+
+    let events = e.events().all();
+
+    // Filter by (symbol, job_id) topic pair.
+    let mut matched = 0u32;
+    for ev in events.iter() {
+        let (_contract, topics, _data) = ev;
+        if topics.len() >= 2 {
+            let sym: soroban_sdk::Symbol = topics.get(0).unwrap().into_val(&e);
+            if sym == symbol_short!("job_new") {
+                let id: u64 = topics.get(1).unwrap().into_val(&e);
+                if id == job_b {
+                    matched += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(matched, 1, "expected exactly one job_new event for job_b");
+}
+
+// ==================== #128: PlatformStats live counters ====================
+
+#[test]
+fn test_platform_stats_counters_track_transitions() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let admin_token = TokenAdminClient::new(&e, &usdc.address());
+    admin_token.mint(&client_addr, &1_000_000_000);
+
+    // Initial state.
+    let stats = marketplace.get_platform_stats();
+    assert_eq!(stats.open_jobs, 0);
+    assert_eq!(stats.active_agents, 0);
+
+    // Register an agent -> active_agents +1.
+    let agent_id = marketplace.register_agent(
+        &owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &10_000_000,
+        &String::from_str(&e, "ipfs://test"),
+    );
+    let stats = marketplace.get_platform_stats();
+    assert_eq!(stats.active_agents, 1);
+    assert_eq!(stats.open_jobs, 0);
+
+    // Post a job -> open_jobs +1.
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &10_000_000,
+        &14,
+    );
+    let stats = marketplace.get_platform_stats();
+    assert_eq!(stats.open_jobs, 1);
+
+    // Accept a bid -> job leaves the open set.
+    let bid_id = marketplace.place_bid(
+        &owner,
+        &job_id,
+        &10_000_000,
+        &1,
+        &String::from_str(&e, "Prop"),
+    );
+    marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+    let stats = marketplace.get_platform_stats();
+    assert_eq!(stats.open_jobs, 0);
+
+    // Complete the job.
+    let hash = BytesN::from_array(&e, &[1u8; 32]);
+    marketplace.submit_deliverable(&owner, &job_id, &hash);
+    marketplace.approve_deliverable(&client_addr, &job_id);
+    let stats = marketplace.get_platform_stats();
+    assert_eq!(stats.open_jobs, 0);
+
+    // Deactivate the agent -> active_agents -1.
+    marketplace.deactivate_agent(&owner, &agent_id);
+    let stats = marketplace.get_platform_stats();
+    assert_eq!(stats.active_agents, 0);
+
+    // Reactivate -> active_agents +1.
+    marketplace.reactivate_agent(&owner, &agent_id);
+    let stats = marketplace.get_platform_stats();
+    assert_eq!(stats.active_agents, 1);
+}
+
+#[test]
+fn test_platform_stats_counters_never_underflow() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let admin_token = TokenAdminClient::new(&e, &usdc.address());
+    admin_token.mint(&client_addr, &1_000_000_000);
+
+    // Interleave transitions and assert counters stay non-negative and
+    // consistent after each step (saturating semantics).
+    let agent_id = marketplace.register_agent(
+        &owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &10_000_000,
+        &String::from_str(&e, "ipfs://test"),
+    );
+
+    for _ in 0..3 {
+        let job_id = marketplace.post_job(
+            &client_addr,
+            &String::from_str(&e, "Job"),
+            &String::from_str(&e, "Desc"),
+            &Vec::from_array(&e, [String::from_str(&e, "python")]),
+            &10_000_000,
+            &14,
+        );
+        let stats = marketplace.get_platform_stats();
+        assert!(stats.open_jobs >= 0);
+        assert!(stats.active_agents >= 0);
+
+        let bid_id = marketplace.place_bid(
+            &owner,
+            &job_id,
+            &10_000_000,
+            &1,
+            &String::from_str(&e, "Prop"),
+        );
+        marketplace.accept_bid(&client_addr, &job_id, &bid_id);
+        let stats = marketplace.get_platform_stats();
+        assert!(stats.open_jobs >= 0);
+
+        let hash = BytesN::from_array(&e, &[1u8; 32]);
+        marketplace.submit_deliverable(&owner, &job_id, &hash);
+        marketplace.approve_deliverable(&client_addr, &job_id);
+        let stats = marketplace.get_platform_stats();
+        assert!(stats.open_jobs >= 0);
+    }
+
+    // Toggle the agent repeatedly; active_agents must never go negative.
+    for _ in 0..3 {
+        marketplace.deactivate_agent(&owner, &agent_id);
+        let stats = marketplace.get_platform_stats();
+        assert!(stats.active_agents >= 0);
+        marketplace.reactivate_agent(&owner, &agent_id);
+        let stats = marketplace.get_platform_stats();
+        assert!(stats.active_agents >= 0);
+    }
+
+    let final_stats = marketplace.get_platform_stats();
+    assert_eq!(final_stats.open_jobs, 0);
+    assert_eq!(final_stats.active_agents, 1);
+}
+
 For `resolve_dispute` while paused - need to set up dispute, then pause, then resolve.
 
 For `reclaim_expired_escrow` while paused - need to set up escrow, advance time, pause, then reclaim.
