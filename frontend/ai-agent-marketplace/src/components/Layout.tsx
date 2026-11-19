@@ -4,6 +4,7 @@ import { useWallet } from '../contexts/WalletContext';
 import { Button } from './ui/Button';
 import { WalletConnect } from './WalletConnect';
 import { UserMenu } from './UserMenu';
+import { TransactionStatus } from './TransactionStatus';
 import { Lock } from 'lucide-react';
 
 /**
@@ -176,6 +177,8 @@ export const Layout: React.FC = () => {
       <main className="flex-1">
         <Outlet />
       </main>
+
+      <TransactionStatus />
 
       <footer className="border-t py-8">
         <div className="mx-auto max-w-7xl px-4 text-center text-sm text-muted-foreground">

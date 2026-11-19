@@ -14,6 +14,10 @@ import {
   StrKey
 } from '@stellar/stellar-sdk';
 import { MarketplaceClient } from '@/lib/marketplaceClient';
+import { useTxTracker } from '@/lib/txTracker';
+
+/** Transactions still unconfirmed this long after submission are treated as expired (#184). */
+const TX_EXPIRY_MS = 5 * 60 * 1000;
 
 export interface ContractConfig {
   contractId: string;
@@ -179,6 +183,16 @@ export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({ child
       hash = sendResult.hash;
     }
 
+    // #184: track the hash so its status survives a page refresh.
+    const tracker = useTxTracker.getState();
+    tracker.track({
+      hash,
+      label: method,
+      status: 'pending',
+      networkPassphrase: config.networkPassphrase,
+      submittedAt: Date.now(),
+    });
+
     let txResult = await rpc.getTransaction(hash);
     const deadline = Date.now() + 30000;
     while (txResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND) {
@@ -190,11 +204,51 @@ export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({ child
     }
 
     if (txResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
+      tracker.setStatus(hash, 'failed');
       throw new Error(`Transaction failed with status: ${txResult.status}`);
     }
+    tracker.setStatus(hash, 'success');
 
     return (txResult as SorobanRpc.Api.GetSuccessfulTransactionResponse).returnValue ?? null;
   }, [contract, rpc, config]);
+
+  // #184: resume polling transactions that were still pending when the page
+  // was last closed or refreshed.
+  useEffect(() => {
+    if (!rpc || !config) return;
+    let cancelled = false;
+    const { txs, setStatus } = useTxTracker.getState();
+    const pending = txs.filter(
+      (tx) => tx.status === 'pending' && tx.networkPassphrase === config.networkPassphrase,
+    );
+
+    pending.forEach(async (tx) => {
+      while (!cancelled) {
+        try {
+          const result = await rpc.getTransaction(tx.hash);
+          if (result.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
+            setStatus(tx.hash, 'success');
+            return;
+          }
+          if (result.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
+            setStatus(tx.hash, 'failed');
+            return;
+          }
+        } catch {
+          // Transient RPC error; retry on the next tick.
+        }
+        if (Date.now() - tx.submittedAt > TX_EXPIRY_MS) {
+          setStatus(tx.hash, 'failed');
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [rpc, config]);
 
   // Typed contract client built from the current `invokeContract`. Returns
   // null while not connected so pages can show a "connect" prompt instead of
