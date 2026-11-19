@@ -1,0 +1,49 @@
+name: Escrow Reconciliation
+
+on:
+  schedule:
+    # Daily at 06:00 UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      network:
+        description: 'Network to reconcile'
+        required: true
+        default: 'testnet'
+        type: choice
+        options:
+          - testnet
+          - mainnet
+          - futurenet
+
+jobs:
+  reconcile:
+    name: Reconcile escrow (${{ inputs.network || vars.RECONCILE_NETWORK || 'testnet' }})
+    runs-on: ubuntu-latest
+    env:
+      NETWORK: ${{ inputs.network || vars.RECONCILE_NETWORK || 'testnet' }}
+      CONTRACT_ID: ${{ secrets.MARKETPLACE_CONTRACT_ID }}
+      SOURCE_ACCOUNT: ${{ secrets.RECONCILE_SECRET_KEY }}
+      ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Stellar CLI
+        run: |
+          curl -sSL https://github.com/stellar/stellar-cli/raw/main/install.sh | bash -s -- --version 21.0.0
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Reconcile escrow ledger against USDC balance
+        run: ./scripts/reconcile-escrow.sh "$NETWORK"
+
+      - name: Publish report to job summary
+        if: always()
+        run: cat reports/*.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: escrow-reconciliation-${{ env.NETWORK }}-${{ github.run_id }}
+          path: reports/
+          retention-days: 90
