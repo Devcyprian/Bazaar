@@ -541,6 +541,7 @@ Soroban RPC or Freighter wallet is required. Run in any environment.
 - [ ] Configure USDC mainnet contract ID
 - [ ] Set production RPC endpoints
 - [ ] Schedule `scripts/keeper.sh` (cron) to bump TTL of open escrows
+- [ ] Run `./scripts/smoke-test.sh mainnet <test-account>` after deploy and confirm it reports PASSED
 - [ ] Configure domain & SSL
 - [ ] Set up monitoring (Sentry, Datadog)
 - [ ] Load test with k6
