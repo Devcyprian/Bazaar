@@ -538,6 +538,7 @@ Soroban RPC or Freighter wallet is required. Run in any environment.
 
 - [ ] Audit smart contract (recommended: Trail of Bits, Certora)
 - [ ] Deploy to mainnet with multisig admin
+- [ ] Follow the [key management runbook](docs/mainnet/key-management.md) — mainnet admin key never stored in CI
 - [ ] Configure USDC mainnet contract ID
 - [ ] Set production RPC endpoints
 - [ ] Schedule `scripts/keeper.sh` (cron) to bump TTL of open escrows
@@ -565,6 +566,9 @@ network only sees its own values. `deploy-mainnet` runs only after
 `deploy-testnet` succeeds.
 
 ### Deploy Contract (Mainnet)
+
+> Mainnet admin and deploy keys must be held on hardware wallets / KMS as described in
+> [`docs/mainnet/key-management.md`](docs/mainnet/key-management.md), not as plain CLI identities.
 
 ```bash
 # Use multisig for admin
