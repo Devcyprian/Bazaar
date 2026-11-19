@@ -212,6 +212,7 @@ pub enum DataKey {
     SkillAgents(String),
     PlatformStats,
     IsPaused,
+    Denylist,
 }
 
 #[contracttype]
@@ -288,6 +289,9 @@ pub enum Error {
     InvalidDisputeEvidence = 50,
     ContractPaused = 51,
     CannotBidOnOwnJob = 52,
+    /// Returned by `post_job` / `place_bid` when the caller's address is on the
+    /// admin-managed sanctions/denylist.
+    AddressBlocked = 53,
 }
 
 #[contract]
@@ -387,6 +391,76 @@ impl AiAgentMarketplace {
     /// Check if contract is paused
     pub fn is_paused(env: Env) -> bool {
         env.storage().instance().get(&DataKey::IsPaused).unwrap_or(false)
+    }
+
+    /// Admin: pause the contract (alias for `set_paused(true)`).
+    ///
+    /// Used by the incident response runbook to halt state-changing operations
+    /// during an incident.
+    pub fn pause(env: Env, admin: Address) -> Result<(), Error> {
+        Self::set_paused(env, admin, true)
+    }
+
+    /// Admin: unpause the contract (alias for `set_paused(false)`).
+    pub fn unpause(env: Env, admin: Address) -> Result<(), Error> {
+        Self::set_paused(env, admin, false)
+    }
+
+    /// Admin: add an address to the sanctions/denylist.
+    ///
+    /// Denied addresses cannot post jobs or place bids.  The list is stored on
+    /// chain and can be managed without redeploying the contract.
+    pub fn add_to_denylist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config = Self::get_config(&env)?;
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut denylist: Map<Address, bool> = env.storage().instance()
+            .get(&DataKey::Denylist)
+            .unwrap_or(Map::new(&env));
+        denylist.set(address.clone(), true);
+        env.storage().instance().set(&DataKey::Denylist, &denylist);
+
+        env.events().publish(
+            (symbol_short!("deny_add"),),
+            (admin, address),
+        );
+        Ok(())
+    }
+
+    /// Admin: remove an address from the sanctions/denylist.
+    pub fn remove_from_denylist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config = Self::get_config(&env)?;
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut denylist: Map<Address, bool> = env.storage().instance()
+            .get(&DataKey::Denylist)
+            .unwrap_or(Map::new(&env));
+        denylist.remove(address.clone());
+        env.storage().instance().set(&DataKey::Denylist, &denylist);
+
+        env.events().publish(
+            (symbol_short!("deny_rem"),),
+            (admin, address),
+        );
+        Ok(())
+    }
+
+    /// Get the current sanctions/denylist.
+    pub fn get_denylist(env: Env) -> Map<Address, bool> {
+        env.storage().instance()
+            .get(&DataKey::Denylist)
+            .unwrap_or(Map::new(&env))
+    }
+
+    /// Check whether an address is on the denylist.
+    pub fn is_denylisted(env: Env, address: Address) -> bool {
+        Self::is_denylisted(&env, &address)
     }
 
     /// Register a new AI agent
@@ -597,6 +671,7 @@ impl AiAgentMarketplace {
     ) -> Result<u64, Error> {
         client.require_auth();
         Self::ensure_not_paused(&env)?;
+        Self::ensure_not_denylisted(&env, &client)?;
 
         let config = Self::get_config(&env)?;
         
@@ -699,6 +774,7 @@ impl AiAgentMarketplace {
     ) -> Result<u64, Error> {
         agent_owner.require_auth();
         Self::ensure_not_paused(&env)?;
+        Self::ensure_not_denylisted(&env, &agent_owner)?;
 
         let config = Self::get_config(&env)?;
         let job = Self::get_job(&env, job_id)?;
@@ -1802,6 +1878,20 @@ impl AiAgentMarketplace {
         let paused: bool = env.storage().instance().get(&DataKey::IsPaused).unwrap_or(false);
         if paused {
             return Err(Error::ContractPaused);
+        }
+        Ok(())
+    }
+
+    fn is_denylisted(env: &Env, address: &Address) -> bool {
+        let denylist: Map<Address, bool> = env.storage().instance()
+            .get(&DataKey::Denylist)
+            .unwrap_or(Map::new(env));
+        denylist.get(address.clone()).unwrap_or(false)
+    }
+
+    fn ensure_not_denylisted(env: &Env, address: &Address) -> Result<(), Error> {
+        if Self::is_denylisted(env, address) {
+            return Err(Error::AddressBlocked);
         }
         Ok(())
     }

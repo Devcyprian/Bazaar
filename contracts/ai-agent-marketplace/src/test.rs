@@ -552,6 +552,276 @@ fn test_set_paused_and_circuit_breaker() {
     assert!(!marketplace.is_paused());
 }
 
+// ==================== Pause Drill Tests ====================
+
+/// While paused, state-changing entry points must be rejected with `ContractPaused`.
+#[test]
+fn test_pause_blocks_state_changing_calls() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let agent_owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    // Pause the contract
+    marketplace.set_paused(&admin, &true);
+    assert!(marketplace.is_paused());
+
+    // post_job must be blocked
+    let post_result = marketplace.try_post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &14,
+    );
+    assert_eq!(post_result, Err(Ok(Error::ContractPaused)));
+
+    // register_agent must be blocked
+    let register_result = marketplace.try_register_agent(
+        &agent_owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &String::from_str(&e, "ipfs://test"),
+    );
+    assert_eq!(register_result, Err(Ok(Error::ContractPaused)));
+}
+
+/// Unpausing restores normal operation (the "resume" half of the drill).
+#[test]
+fn test_unpause_restores_operations() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    marketplace.set_paused(&admin, &true);
+    assert!(marketplace.is_paused());
+
+    marketplace.set_paused(&admin, &false);
+    assert!(!marketplace.is_paused());
+
+    // post_job works again
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &14,
+    );
+    assert_eq!(job_id, 1);
+}
+
+/// Only the admin may pause or unpause the contract.
+#[test]
+fn test_only_admin_can_pause() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let attacker = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let result = marketplace.try_set_paused(&attacker, &true);
+    assert!(result.is_err());
+    assert!(!marketplace.is_paused());
+}
+
+// ==================== Denylist / Sanctions Screening Tests ====================
+
+/// Admin can add an address to the denylist and it is reported as blocked.
+#[test]
+fn test_admin_can_add_to_denylist() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let blocked = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    assert!(!marketplace.is_denylisted(&blocked));
+
+    marketplace.add_to_denylist(&admin, &blocked);
+    assert!(marketplace.is_denylisted(&blocked));
+}
+
+/// Admin can remove an address from the denylist without redeploying.
+#[test]
+fn test_admin_can_remove_from_denylist() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let blocked = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    marketplace.add_to_denylist(&admin, &blocked);
+    assert!(marketplace.is_denylisted(&blocked));
+
+    marketplace.remove_from_denylist(&admin, &blocked);
+    assert!(!marketplace.is_denylisted(&blocked));
+}
+
+/// Non-admin callers cannot modify the denylist.
+#[test]
+fn test_non_admin_cannot_modify_denylist() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let attacker = Address::generate(&e);
+    let target = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let add_result = marketplace.try_add_to_denylist(&attacker, &target);
+    assert!(add_result.is_err());
+    assert!(!marketplace.is_denylisted(&target));
+
+    // Even if an address is on the list, a non-admin cannot remove it.
+    marketplace.add_to_denylist(&admin, &target);
+    let remove_result = marketplace.try_remove_from_denylist(&attacker, &target);
+    assert!(remove_result.is_err());
+    assert!(marketplace.is_denylisted(&target));
+}
+
+/// A denylisted address cannot post a job.
+#[test]
+fn test_denylisted_address_cannot_post_job() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let blocked = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    marketplace.add_to_denylist(&admin, &blocked);
+
+    let result = marketplace.try_post_job(
+        &blocked,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &14,
+    );
+    assert_eq!(result, Err(Ok(Error::AddressBlocked)));
+}
+
+/// A denylisted address cannot place a bid.
+#[test]
+fn test_denylisted_address_cannot_place_bid() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let client_addr = Address::generate(&e);
+    let blocked_agent = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    // Register the agent before it is blocked so only the bid path is exercised.
+    marketplace.register_agent(
+        &blocked_agent,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &String::from_str(&e, "ipfs://test"),
+    );
+
+    let job_id = marketplace.post_job(
+        &client_addr,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &14,
+    );
+
+    marketplace.add_to_denylist(&admin, &blocked_agent);
+
+    let result = marketplace.try_place_bid(
+        &blocked_agent,
+        &job_id,
+        &10_000_000,
+        &1,
+        &String::from_str(&e, "Prop"),
+    );
+    assert_eq!(result, Err(Ok(Error::AddressBlocked)));
+}
+
+/// Once removed from the denylist, an address can post and bid again.
+#[test]
+fn test_unblocked_address_can_operate_again() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let user = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    marketplace.add_to_denylist(&admin, &user);
+
+    let blocked = marketplace.try_post_job(
+        &user,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &14,
+    );
+    assert_eq!(blocked, Err(Ok(Error::AddressBlocked)));
+
+    // Admin lifts the restriction
+    marketplace.remove_from_denylist(&admin, &user);
+    assert!(!marketplace.is_denylisted(&user));
+
+    // Posting works again
+    let job_id = marketplace.post_job(
+        &user,
+        &String::from_str(&e, "Job"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &14,
+    );
+    assert_eq!(job_id, 1);
+
+    // And bidding works again
+    marketplace.register_agent(
+        &user,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::new(&e),
+        &10_000_000,
+        &String::from_str(&e, "ipfs://test"),
+    );
+    let bid_id = marketplace.place_bid(
+        &user,
+        &job_id,
+        &10_000_000,
+        &1,
+        &String::from_str(&e, "Prop"),
+    );
+    assert_eq!(bid_id, 1);
+}
+
 #[test]
 fn test_reclaim_expired_escrow() {
     let e = Env::default();
