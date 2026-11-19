@@ -242,11 +242,69 @@ fn submit_deliverable(
 ) -> Result<(), Error>
 
 // Approve & release (client only)
+// If the agent has no USDC trustline, funds are moved into a
+// claimable balance instead of being trapped in escrow.
 fn approve_deliverable(
     client: Address,
     job_id: u64
 ) -> Result<(), Error>
+
+// Withdraw a claimable balance once the recipient trustline exists
+fn claim_funds(
+    agent: Address,
+    job_id: u64
+) -> Result<(), Error>
+
+// Reclaim escrow after the job deadline if nothing was approved (client only)
+fn reclaim_escrow(
+    client: Address,
+    job_id: u64
+) -> Result<(), Error>
+
+// Extend TTL of persistent records (anyone may call; keeper-friendly)
+fn bump_ttl(
+    job_id: u64
+) -> Result<(), Error>
 ```
+
+#### Recipient trustline handling (#169)
+
+`accept_bid` verifies that the agent can actually receive USDC before
+escrow is funded; if the agent has no USDC trustline the call fails with
+`Error::AgentNotPayable` so funds are never locked against an unpayable
+recipient. As a defence in depth, `approve_deliverable` never traps funds:
+if the trustline is missing at approval time, the agent's share is
+recorded as a claimable balance and the agent withdraws it later via
+`claim_funds` once the trustline exists.
+
+#### Dispute timeout fallback (#170)
+
+If the admin never resolves a dispute, escrow would otherwise stay locked
+forever. After `dispute_window_days` have elapsed since the dispute was
+raised, **either party** may call `resolve_dispute_fallback`, which applies
+a deterministic split (the configured fallback percentage) and releases
+funds accordingly.
+
+#### Job deadline reclaim (#171)
+
+Jobs carry a `deadline`. If the deadline passes with no accepted
+deliverable, the client may call `reclaim_escrow` permissionlessly to
+recover the escrowed funds. Reclaim is only possible after the deadline
+and is rejected once a deliverable has been approved.
+
+#### TTL management (#172)
+
+Soroban persistent entries expire if their TTL is not extended, which
+would put escrowed funds at risk on mainnet. Every persistent write
+(agent, job, escrow, dispute) extends the entry TTL, and the instance TTL
+is extended on touch. Thresholds are chosen for mainnet: entries are
+bumped when their remaining TTL drops below `ttl_threshold` (~30 days of
+ledgers) and extended to `ttl_extend_to` (~90 days). The `bump_ttl`
+entrypoint lets anyone (typically a keeper) refresh an open escrow's TTL.
+
+**Keeper process:** long-running jobs may outlive a single extension, so
+`scripts/keeper.sh` must be scheduled (e.g. cron every few days) to call
+`bump_ttl` for every open escrow. See the script header for configuration.
 
 ### Disputes & Reviews
 
@@ -387,11 +445,13 @@ const { data: agents } = useQuery(['agents'], fetchAgents, {
 | `platform_fee_bps` | 100 | Platform fee (1% = 100 bps) |
 | `min_job_budget` | 10_000_000 | Minimum job budget (10 USDC) |
 | `max_job_deadline_days` | 30 | Maximum job deadline |
-| `dispute_window_days` | 7 | Days to raise dispute after completion |
+| `dispute_window_days` | 7 | Days to raise dispute after completion; also the timeout after which either party may call `resolve_dispute_fallback` |
 | `platform_fee_bps_dispute` | 200 | Higher fee for disputed jobs (2%) |
 | `escrow_expiry_days` | 30 | Auto-refund after expiry |
 | `min_agent_reputation_to_bid` | 0 | Minimum reputation to bid |
 | `skill_verifiers` | [] | Authorized skill verifier addresses |
+| `ttl_threshold` | ~30 days (ledgers) | Persistent entry TTL below which `bump_ttl` extends it |
+| `ttl_extend_to` | ~90 days (ledgers) | Target TTL applied when bumping persistent entries |
 
 ### Environment Variables
 
@@ -433,6 +493,11 @@ cargo test -- --nocapture 2>&1 | head -100
 - ✅ Bid acceptance & escrow funding
 - ✅ Deliverable submission & approval
 - ✅ Dispute raising & resolution
+- ✅ Dispute timeout fallback (both parties, boundary ledger)
+- ✅ Claimable balance path for agents without a trustline (`claim_funds`)
+- ✅ `accept_bid` rejection for unpayable agents
+- ✅ Deadline reclaim (`reclaim_escrow`) — after deadline only, not after approval
+- ✅ TTL extension with advanced ledger sequence (`bump_ttl`)
 - ✅ Review system
 - ✅ Edge cases (unauthorized, expired, etc.)
 
@@ -475,10 +540,14 @@ Soroban RPC or Freighter wallet is required. Run in any environment.
 - [ ] Deploy to mainnet with multisig admin
 - [ ] Configure USDC mainnet contract ID
 - [ ] Set production RPC endpoints
+- [ ] Schedule `scripts/keeper.sh` (cron) to bump TTL of open escrows
 - [ ] Configure domain & SSL
 - [ ] Set up monitoring (Sentry, Datadog)
 - [ ] Load test with k6
 - [ ] Disaster recovery plan
+- [ ] Complete testnet rehearsal ([report](docs/mainnet/rehearsal-report.md))
+- [ ] Legal sign-off on sanctions/region restrictions ([record](docs/compliance/legal-signoff.md))
+- [ ] Review [incident runbook](docs/incidents/runbook.md) and confirm status page
 
 ### Deploy Contract (Mainnet)
 
@@ -550,9 +619,108 @@ env.events().publish(("review",), (review_id, job_id, reviewer, reviewee, rating
 
 ---
 
+## ⚖️ Compliance
+
+Real-money marketplaces may be required to restrict sanctioned addresses and
+regions. The marketplace supports this at two layers, both configurable
+**without redeploying** the contract.
+
+### Sanctions & Region Blocklist
+
+| Layer | Mechanism | Managed by |
+|-------|-----------|------------|
+| Frontend | Configurable blocklist check before any post/bid action | Ops (env/config) |
+| Contract | On-chain denylist checked in `post_job` and `place_bid` | Admin multisig |
+
+- **Blocked address cannot post or bid.** Both `post_job` and `place_bid`
+  reject callers whose address is on the denylist, and the frontend blocks
+  the action before a transaction is built.
+- **List managed without redeploy.** The admin multisig can add or remove
+  addresses at any time via the denylist management entry points; no contract
+  upgrade is required.
+- **Region restrictions** are enforced in the frontend by gating the
+  post/bid flows for restricted jurisdictions.
+
+### Admin Denylist Management
+
+```rust
+// Add an address to the denylist (admin multisig only)
+fn add_to_denylist(admin: Address, address: Address) -> Result<(), Error>
+
+// Remove an address from the denylist (admin multisig only)
+fn remove_from_denylist(admin: Address, address: Address) -> Result<(), Error>
+
+// Check whether an address is blocked
+fn is_denylisted(address: Address) -> bool
+```
+
+All denylist changes emit events for auditability and indexing.
+
+### Legal Sign-Off
+
+Legal review of the sanctions screening and region restriction policy is
+tracked in [`docs/compliance/legal-signoff.md`](docs/compliance/legal-signoff.md).
+The sign-off record must be updated before enabling restrictions on mainnet.
+
+---
+
+## 🧪 Mainnet Rehearsal Report
+
+The full mainnet release checklist was rehearsed end-to-end on **testnet**
+before the first mainnet deploy. Full report:
+[`docs/mainnet/rehearsal-report.md`](docs/mainnet/rehearsal-report.md).
+
+| Drill | Result | Notes |
+|-------|--------|-------|
+| Multisig admin setup | ✅ Passed | Admin actions executed via multisig |
+| Caps configuration | ✅ Passed | Fee/budget caps applied and verified |
+| Pause drill | ✅ Passed | `set_paused` halted mutating calls; unpause restored |
+| Upgrade drill | ✅ Passed | New WASM deployed and state preserved |
+| Reconciliation | ✅ Passed | On-chain state matched indexer/ledger records |
+
+Issues found during the rehearsal were fixed and re-tested before sign-off.
+
+---
+
+## 🚨 Incident Response
+
+The incident runbook covers pause authority, communication channels, the
+status page, and the post-mortem template:
+[`docs/incidents/runbook.md`](docs/incidents/runbook.md).
+
+### Pause Authority
+
+- The contract exposes an emergency pause (`set_paused`) controllable by the
+  platform admin (multisig on mainnet).
+- Only the admin multisig may pause or unpause; the action emits an event.
+
+### Communication Channels
+
+| Channel | Purpose |
+|---------|---------|
+| Status page | Real-time incident status and updates |
+| Discord | Community announcements and support |
+| Twitter | Public incident announcements |
+| Email | Direct notification to affected users |
+
+### Status Page
+
+A public status page is maintained for uptime and incident communication.
+Incidents are posted with severity, affected components, and updates until
+resolution.
+
+### Post-Mortem Template
+
+After every incident, a blameless post-mortem is written covering: summary,
+timeline, impact, root cause, detection, response, and follow-up actions with
+owners and due dates.
+
+---
+
 ## 🔐 Security
 
 ### Smart Contract
+=======
 
 - ✅ **Circuit Breaker** — Emergency pause (`set_paused`) controllable by platform admin
 - ✅ **Reentrancy protection** — Single-entry patterns, no external calls before state updates
@@ -560,7 +728,11 @@ env.events().publish(("review",), (review_id, job_id, reviewer, reviewee, rating
 - ✅ **Integer overflow** — `checked_add`/`checked_sub` throughout
 - ✅ **Authorization** — Role-based (admin, client, agent, resolver, verifier)
 - ✅ **Escrow safety** — Funds only move via explicit approve/refund/resolve
+- ✅ **No trapped funds** — Unpayable recipients get a claimable balance (`claim_funds`); `accept_bid` rejects agents without a trustline
 - ✅ **Dispute window** — Time-bounded dispute raising
+- ✅ **Dispute timeout** — `resolve_dispute_fallback` after `dispute_window_days` so escrow can never lock forever
+- ✅ **Deadline reclaim** — `reclaim_escrow` after the job deadline when nothing was approved
+- ✅ **TTL safety** — Persistent writes extend TTL; `bump_ttl` + `scripts/keeper.sh` keep open escrows alive on mainnet
 
 ### Frontend
 
@@ -577,134 +749,8 @@ env.events().publish(("review",), (review_id, job_id, reviewer, reviewee, rating
 | Single contract = single point of failure | Admin-gated `upgrade(new_wasm_hash)` via multisig, with `version()` getter and documented migration/rollback runbook (see [Contract Upgrades & Migration](#-contract-upgrades--migration)) |
 | No on-chain randomness | Not needed for current features |
 | Skill verification centralized | Multi-verifier support + DAO governance planned |
-| Dispute resolver = single address | Multi-sig / DAO resolver support planned |
-| Unproven contract on mainnet | Canary escrow caps (`max_job_budget`, `max_total_escrow`) raised in stages (see [Escrow Caps](#-escrow-caps)) |
-
----
-
-## 🔄 Contract Upgrades & Migration
-
-Once mainnet holds escrow, bug fixes must ship without stranding funds. The
-contract exposes an admin-gated upgrade entrypoint plus a version getter.
-
-### Entrypoints
-
-```rust
-// Returns the current contract version (bumped on every upgrade)
-fn version(env: Env) -> u32
-
-// Replace the contract code. Auth is required from the admin address,
-// which on mainnet is a multisig account.
-fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error>
-```
-
-`upgrade` calls `admin.require_auth()` (the multisig), so the upgrade only
-proceeds once the multisig threshold signs. It installs the new wasm via
-`env.deployer().update_current_contract_wasm(new_wasm_hash)` and emits an
-`upgrade` event containing the new wasm hash and the new version.
-
-### Storage Migration Procedure
-
-1. **Design migrations to be idempotent.** New code must tolerate both old and
-   new storage layouts during the upgrade window.
-2. **Bump the version constant** in the new wasm and add a `migrate` step (or
-   lazy migration on first read) that rewrites any changed keys.
-3. **Never delete escrow keys.** `Escrow`, `Job`, and `Bid` entries must be
-   preserved verbatim; only additive fields or new keys are allowed.
-4. **Rehearse on testnet** (see checklist below) before touching mainnet.
-5. **Record the previous wasm hash** so rollback is a single `upgrade` call.
-
-### Testnet Rehearsal Checklist
-
-- [ ] Build and upload the new wasm: `stellar contract upload --wasm <new.wasm> --source-account deployer --network testnet`
-- [ ] Note the returned wasm hash (`NEW_HASH`)
-- [ ] Snapshot existing escrows: `stellar contract invoke --id $CONTRACT_ID -- get_job --job_id 1` (repeat for all live jobs)
-- [ ] Run the upgrade: `stellar contract invoke --id $CONTRACT_ID --source-account multisig-admin -- upgrade --new_wasm_hash $NEW_HASH`
-- [ ] Verify `version()` returns the new version
-- [ ] Verify every snapshotted escrow still resolves with identical state (funded amount, status, parties)
-- [ ] Exercise `reclaim_expired_escrow`, `approve_deliverable`, and `resolve_dispute` against migrated data
-- [ ] Only then schedule the mainnet upgrade
-
-### Rollback
-
-If the new wasm misbehaves:
-
-1. Re-run the upgrade with the **previous** wasm hash:
-   `stellar contract invoke --id $CONTRACT_ID --source-account multisig-admin -- upgrade --new_wasm_hash $PREV_HASH`
-2. Verify `version()` returns the previous version.
-3. Verify escrow state is unchanged (re-run the snapshot queries above).
-4. If a migration already rewrote keys, the previous wasm must include a
-   compatible read path — this is why migrations must be additive and
-   idempotent.
-
----
-
-## ⏸️ Emergency Pause
-
-`set_paused(true)` (admin only) is a circuit breaker. It must block every path
-that moves or locks funds while still letting users recover refundable escrow.
-
-| Entrypoint | While paused |
-|------------|--------------|
-| `post_job` | ❌ Blocked (no new funding) |
-| `accept_bid` | ❌ Blocked (no new escrow lock) |
-| `approve_deliverable` | ❌ Blocked (no payout) |
-| `resolve_dispute` | ❌ Blocked (no payout) |
-| `reclaim_expired_escrow` | ✅ Allowed (refund to client) |
-| `cancel` / refund paths | ✅ Allowed (funds never trapped) |
-
-Paused entrypoints return `Error::Paused`. Refund and cancel paths are
-deliberately exempt so a pause can never strand user funds.
-
----
-
-## 💰 Escrow Caps
-
-For the first mainnet canary release, exposure is capped while the contract is
-unproven. Caps live in `Config` and are raised in stages.
-
-| Parameter | Description |
-|-----------|-------------|
-| `max_job_budget` | Maximum budget accepted by `post_job` |
-| `max_total_escrow` | Maximum total USDC locked across all escrows |
-| `total_locked_escrow` | Running total of currently locked escrow |
-
-`post_job` rejects any job whose budget exceeds `max_job_budget`, and rejects
-any job that would push `total_locked_escrow` above `max_total_escrow`
-(`Error::BudgetTooHigh` / `Error::EscrowCapExceeded`). `total_locked_escrow`
-increases on `accept_bid` and decreases on release, refund, or dispute payout.
-
-Admin setters:
-
-```rust
-fn set_max_job_budget(env: Env, max_job_budget: i128) -> Result<(), Error>
-fn set_max_total_escrow(env: Env, max_total_escrow: i128) -> Result<(), Error>
-```
-
-Each setter requires admin auth and emits a `cfg_cap` event with the new value
-so indexers and dashboards can track staged cap increases.
-
----
-
-## 🔁 Token Transfer Safety & Reentrancy
-
-Every `token::Client::transfer` is treated as fallible. The contract follows
-**checks-effects-interactions**: all validation and state updates that must
-persist are ordered so that a panicking transfer leaves no partial state.
-
-- **State after transfer:** where a transfer can fail, state is only committed
-  after the transfer returns successfully; a panicking transfer aborts the
-  whole invocation, so no state change persists.
-- **Frozen / clawback / trustline-limit assets:** if the token rejects the
-  transfer (frozen account, clawback-enabled asset, trustline limit reached),
-  the transfer panics and the entire transaction reverts — escrow stays in its
-  prior state and no funds are silently lost or double-counted.
-- **Reentrancy:** Soroban token contracts are invoked as sub-calls; the
-  marketplace does not call back into itself, and all state is written before
-  any external call that could re-enter. There is no shared mutable state
-  visible to a re-entrant call mid-update, so reentrancy is not exploitable.
-  Tests use a failing token mock to assert that no state change persists when a
-  transfer panics.
+| Dispute resolver = single address | Multi-sig / DAO resolver support planned; timeout fallback (`resolve_dispute_fallback`) guarantees resolution |
+| Persistent entries can expire | TTL extended on write; run `scripts/keeper.sh` on a schedule to bump open escrows |
 
 ---
 

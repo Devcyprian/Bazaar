@@ -5,6 +5,21 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      rehearsal_network:
+        description: 'Network to run the mainnet rehearsal against'
+        required: true
+        default: 'testnet'
+        type: choice
+        options:
+          - testnet
+          - futurenet
+      rehearsal_confirm:
+        description: 'Type "rehearse" to confirm running the deploy/pause/upgrade drills'
+        required: true
+        default: ''
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,6 +62,15 @@ jobs:
         
       - name: Test
         run: cargo test --all
+
+      # Explicitly re-run the security-critical suites so a regression in the
+      # denylist or pause/upgrade guards fails the build even if test filtering
+      # elsewhere changes. These cover the mainnet release blockers.
+      - name: Test denylist & pause/upgrade guards
+        run: |
+          cargo test --all denylist
+          cargo test --all pause
+          cargo test --all upgrade
 
   contract-optimize:
     name: Optimize WASM
@@ -216,6 +240,108 @@ jobs:
           name: playwright-report
           path: frontend/ai-agent-marketplace/playwright-report/
           retention-days: 7
+
+  # ========== MAINNET RELEASE REHEARSAL ==========
+  # Manual-only job that runs the full mainnet release checklist against a
+  # non-production network (testnet by default): deploy, initialize with the
+  # multisig admin and caps, pause drill, upgrade drill and state
+  # reconciliation. The generated rehearsal report is uploaded as an artifact
+  # and must be reviewed/merged before the first mainnet deploy.
+  rehearsal:
+    name: Mainnet Rehearsal (${{ inputs.rehearsal_network }})
+    if: github.event_name == 'workflow_dispatch' && inputs.rehearsal_confirm == 'rehearse'
+    runs-on: ubuntu-latest
+    environment: rehearsal
+    defaults:
+      run:
+        working-directory: contracts/ai-agent-marketplace
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: wasm32-unknown-unknown
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release WASM
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Install Stellar CLI
+        run: |
+          curl -sSL https://github.com/stellar/stellar-cli/raw/main/install.sh | bash -s -- --version 21.0.0
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Prepare rehearsal workspace
+        run: mkdir -p rehearsal-report
+
+      - name: Deploy & initialize (multisig admin, caps)
+        env:
+          NETWORK: ${{ inputs.rehearsal_network }}
+          STELLAR_SECRET_KEY: ${{ secrets.REHEARSAL_SECRET_KEY }}
+          ADMIN_MULTISIG: ${{ secrets.REHEARSAL_ADMIN_MULTISIG }}
+          WASM_PATH: target/wasm32-unknown-unknown/release/ai_agent_marketplace.wasm
+        run: |
+          ./scripts/rehearsal/deploy.sh 2>&1 | tee rehearsal-report/01-deploy.log
+
+      - name: Pause drill
+        env:
+          NETWORK: ${{ inputs.rehearsal_network }}
+          STELLAR_SECRET_KEY: ${{ secrets.REHEARSAL_SECRET_KEY }}
+        run: |
+          ./scripts/rehearsal/pause-drill.sh 2>&1 | tee rehearsal-report/02-pause-drill.log
+
+      - name: Upgrade drill
+        env:
+          NETWORK: ${{ inputs.rehearsal_network }}
+          STELLAR_SECRET_KEY: ${{ secrets.REHEARSAL_SECRET_KEY }}
+          WASM_PATH: target/wasm32-unknown-unknown/release/ai_agent_marketplace.wasm
+        run: |
+          ./scripts/rehearsal/upgrade-drill.sh 2>&1 | tee rehearsal-report/03-upgrade-drill.log
+
+      - name: Reconciliation
+        env:
+          NETWORK: ${{ inputs.rehearsal_network }}
+        run: |
+          ./scripts/rehearsal/reconcile.sh 2>&1 | tee rehearsal-report/04-reconcile.log
+
+      - name: Assemble rehearsal report
+        if: always()
+        run: |
+          {
+            echo "# Mainnet Rehearsal Report"
+            echo ""
+            echo "- Network: ${{ inputs.rehearsal_network }}"
+            echo "- Commit: ${{ github.sha }}"
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- Result: ${{ job.status }}"
+            echo ""
+            for f in rehearsal-report/*.log; do
+              [ -f "$f" ] || continue
+              echo "## $(basename "$f")"
+              echo '```'
+              cat "$f"
+              echo '```'
+              echo ""
+            done
+          } > rehearsal-report/REHEARSAL_REPORT.md
+
+      - name: Upload rehearsal report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rehearsal-report-${{ inputs.rehearsal_network }}
+          path: contracts/ai-agent-marketplace/rehearsal-report/
+          retention-days: 30
 
   # ========== DEPLOY ==========
   deploy-preview:

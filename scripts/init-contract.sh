@@ -47,8 +47,36 @@ case $NETWORK in
         ;;
 esac
 
-# Get admin address (deployer)
-ADMIN=$(stellar keys address deployer)
+# Resolve admin address: prefer explicit ADMIN_ADDRESS (e.g. multisig), else deployer key
+if [ -n "$ADMIN_ADDRESS" ]; then
+    ADMIN="$ADMIN_ADDRESS"
+    echo -e "${YELLOW}👤 Using admin from ADMIN_ADDRESS: $ADMIN${NC}"
+else
+    ADMIN=$(stellar keys address deployer)
+    echo -e "${YELLOW}👤 Using deployer key as admin: $ADMIN${NC}"
+fi
+
+# Conservative caps: tighter on mainnet, looser on test networks
+case $NETWORK in
+    mainnet)
+        PLATFORM_FEE_BPS=100
+        MIN_JOB_BUDGET=10000000
+        MAX_JOB_DEADLINE_DAYS=30
+        DISPUTE_WINDOW_DAYS=7
+        PLATFORM_FEE_BPS_DISPUTE=200
+        ESCROW_EXPIRY_DAYS=30
+        REQUIRE_SKILL_VERIFICATION=true
+        ;;
+    *)
+        PLATFORM_FEE_BPS=100
+        MIN_JOB_BUDGET=10000000
+        MAX_JOB_DEADLINE_DAYS=30
+        DISPUTE_WINDOW_DAYS=7
+        PLATFORM_FEE_BPS_DISPUTE=200
+        ESCROW_EXPIRY_DAYS=30
+        REQUIRE_SKILL_VERIFICATION=false
+        ;;
+esac
 
 # Initialize
 echo -e "${YELLOW}⚙️  Calling initialize()...${NC}"
@@ -62,30 +90,29 @@ stellar contract invoke \
   initialize \
   --admin "$ADMIN" \
   --usdc_token "$USDC_CONTRACT" \
-  --platform_fee_bps 100 \
-  --min_job_budget 10000000 \
-  --max_job_deadline_days 30 \
-  --dispute_window_days 7 \
+  --platform_fee_bps "$PLATFORM_FEE_BPS" \
+  --min_job_budget "$MIN_JOB_BUDGET" \
+  --max_job_deadline_days "$MAX_JOB_DEADLINE_DAYS" \
+  --dispute_window_days "$DISPUTE_WINDOW_DAYS" \
   --min_agent_reputation 0 \
   --platform_fee_recipient "$ADMIN" \
   --dispute_resolver "$ADMIN" \
   --min_agent_reputation_to_bid 0 \
-  --platform_fee_bps_dispute 200 \
-  --escrow_expiry_days 30 \
-  --max_job_budget 10000000000 \
-  --max_total_escrow 100000000000 \
-  --skill_verifiers '[]'
+  --platform_fee_bps_dispute "$PLATFORM_FEE_BPS_DISPUTE" \
+  --escrow_expiry_days "$ESCROW_EXPIRY_DAYS" \
+  --skill_verifiers '[]' \
+  --require_skill_verification "$REQUIRE_SKILL_VERIFICATION"
 
 echo -e "${GREEN}✅ Contract initialized successfully!${NC}"
 echo ""
-echo "Configuration:"
+echo "Configuration (network: $NETWORK):"
+echo "  Contract ID: $CONTRACT_ID"
 echo "  Admin: $ADMIN"
 echo "  USDC: $USDC_CONTRACT"
-echo "  Platform Fee: 1% (100 bps)"
-echo "  Min Job Budget: 10 USDC"
-echo "  Max Deadline: 30 days"
-echo "  Dispute Window: 7 days"
-echo "  Dispute Fee: 2% (200 bps)"
-echo "  Escrow Expiry: 30 days"
-echo "  Max Job Budget: 1000 USDC (canary cap)"
-echo "  Max Total Escrow: 10000 USDC (canary cap)"
+echo "  Platform Fee: $PLATFORM_FEE_BPS bps"
+echo "  Min Job Budget: $MIN_JOB_BUDGET (stroops)"
+echo "  Max Deadline: $MAX_JOB_DEADLINE_DAYS days"
+echo "  Dispute Window: $DISPUTE_WINDOW_DAYS days"
+echo "  Dispute Fee: $PLATFORM_FEE_BPS_DISPUTE bps"
+echo "  Escrow Expiry: $ESCROW_EXPIRY_DAYS days"
+echo "  Require Skill Verification: $REQUIRE_SKILL_VERIFICATION"

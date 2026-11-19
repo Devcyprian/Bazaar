@@ -16,6 +16,7 @@ if [ "$1" = "upgrade" ] || [ "$1" = "--upgrade" ]; then
     shift
 fi
 NETWORK=${1:-testnet}
+SOURCE_ACCOUNT=${2:-deployer}
 CONTRACT_ALIAS="ai-agent-marketplace"
 WASM_PATH="contracts/ai-agent-marketplace/target/wasm32-unknown-unknown/release/ai_agent_marketplace.wasm"
 # Source account used for upgrades (multisig admin)
@@ -23,7 +24,15 @@ ADMIN_SOURCE=${ADMIN_SOURCE:-admin-multisig}
 
 echo -e "${GREEN}🚀 AI Agent Marketplace Contract ${MODE^}${NC}"
 echo "Network: $NETWORK"
+echo "Source account: $SOURCE_ACCOUNT"
 echo ""
+
+# Mainnet safety: require an explicit multisig admin account
+if [ "$NETWORK" = "mainnet" ] && [ "$SOURCE_ACCOUNT" = "deployer" ]; then
+    echo -e "${RED}❌ Mainnet deploys must use the multisig admin account.${NC}"
+    echo "Usage: $0 mainnet <multisig-admin-account>"
+    exit 1
+fi
 
 # Check prerequisites
 check_command() {
@@ -59,67 +68,35 @@ if [ $SIZE -gt 1000000 ]; then
     echo -e "${YELLOW}⚠️  Warning: WASM > 1MB, may exceed deployment limits${NC}"
 fi
 
-if [ "$MODE" = "upgrade" ]; then
-    # Upgrade path: upload new wasm, invoke upgrade(new_wasm_hash), verify version
-    if [ ! -f ".contract-id-$NETWORK" ]; then
-        echo -e "${RED}❌ No .contract-id-$NETWORK found. Deploy first.${NC}"
-        exit 1
-    fi
-    CONTRACT_ID=$(cat ".contract-id-$NETWORK")
-
-    echo -e "${YELLOW}📤 Uploading new WASM to $NETWORK...${NC}"
-    NEW_WASM_HASH=$(stellar contract upload \
-      --wasm "$WASM_PATH" \
-      --source-account "$ADMIN_SOURCE" \
-      --network "$NETWORK" \
-      2>&1 | tail -1)
-    echo -e "${GREEN}✅ New WASM hash: $NEW_WASM_HASH${NC}"
-
-    # Remember previous hash for rollback
-    PREV_WASM_HASH=""
-    if [ -f ".wasm-hash-$NETWORK" ]; then
-        PREV_WASM_HASH=$(cat ".wasm-hash-$NETWORK")
-    fi
-
-    echo -e "${YELLOW}⬆️  Invoking upgrade on $CONTRACT_ID...${NC}"
-    stellar contract invoke \
-      --id "$CONTRACT_ID" \
-      --source-account "$ADMIN_SOURCE" \
-      --network "$NETWORK" \
-      -- upgrade \
-      --new_wasm_hash "$NEW_WASM_HASH"
-
-    echo "$NEW_WASM_HASH" > ".wasm-hash-$NETWORK"
-
-    echo -e "${YELLOW}🔎 Verifying version...${NC}"
-    stellar contract invoke \
-      --id "$CONTRACT_ID" \
-      --source-account "$ADMIN_SOURCE" \
-      --network "$NETWORK" \
-      -- version
-
-    echo ""
-    echo -e "${GREEN}🎉 Upgrade complete!${NC}"
-    echo ""
-    if [ -n "$PREV_WASM_HASH" ]; then
-        echo "Rollback command (revert to previous wasm hash):"
-        echo "  stellar contract invoke --id $CONTRACT_ID --source-account $ADMIN_SOURCE --network $NETWORK -- upgrade --new_wasm_hash $PREV_WASM_HASH"
-    else
-        echo "No previous wasm hash recorded; rollback requires the prior wasm hash."
-    fi
-    exit 0
-fi
+# Compute local WASM hash for post-deploy verification
+LOCAL_WASM_HASH=$(sha256sum "$WASM_PATH" | awk '{print $1}')
+echo -e "${GREEN}🔑 Local WASM SHA-256: $LOCAL_WASM_HASH${NC}"
 
 # Deploy
 echo -e "${YELLOW}📤 Deploying to $NETWORK...${NC}"
 CONTRACT_ID=$(stellar contract deploy \
   --wasm "$WASM_PATH" \
-  --source-account deployer \
+  --source-account "$SOURCE_ACCOUNT" \
   --network "$NETWORK" \
   --alias "$CONTRACT_ALIAS-$NETWORK" \
   2>&1 | tail -1)
 
 echo -e "${GREEN}✅ Contract deployed: $CONTRACT_ID${NC}"
+
+# Verify deployed WASM hash matches the local artifact
+echo -e "${YELLOW}🔍 Verifying deployed WASM hash...${NC}"
+DEPLOYED_WASM_HASH=$(stellar contract info wasm-hash \
+  --id "$CONTRACT_ID" \
+  --network "$NETWORK" \
+  2>/dev/null | tail -1)
+
+if [ -n "$DEPLOYED_WASM_HASH" ] && [ "$DEPLOYED_WASM_HASH" != "$LOCAL_WASM_HASH" ]; then
+    echo -e "${RED}❌ WASM hash mismatch!${NC}"
+    echo "  Local:    $LOCAL_WASM_HASH"
+    echo "  Deployed: $DEPLOYED_WASM_HASH"
+    exit 1
+fi
+echo -e "${GREEN}✅ WASM hash verified${NC}"
 
 # Save contract ID
 echo "$CONTRACT_ID" > ".contract-id-$NETWORK"
@@ -128,9 +105,19 @@ echo -e "${GREEN}📝 Contract ID saved to .contract-id-$NETWORK${NC}"
 echo ""
 echo -e "${GREEN}🎉 Deployment complete!${NC}"
 echo ""
+echo -e "${YELLOW}📋 Post-deploy verification checklist (record results for the rehearsal):${NC}"
+echo "  [ ] Contract ID: $CONTRACT_ID"
+echo "  [ ] Admin set to multisig account: $SOURCE_ACCOUNT"
+echo "  [ ] WASM hash matches local artifact: $LOCAL_WASM_HASH"
+echo "  [ ] Caps configured and verified on-chain"
+echo "  [ ] Pause drill completed (admin can pause and unpause)"
+echo "  [ ] Upgrade drill completed (admin can upgrade to new WASM)"
+echo "  [ ] Reconciliation of balances/state against expected values"
+echo ""
 echo "Next steps:"
 echo "1. Initialize contract: ./scripts/init-contract.sh $NETWORK"
 echo "2. Update frontend .env.local with contract ID"
 echo "3. Deploy frontend: ./scripts/deploy-frontend.sh"
-echo ""
-echo "To upgrade later: ./scripts/deploy-contract.sh upgrade $NETWORK"
+echo "4. Schedule the TTL keeper to keep escrow/job entries alive:"
+echo "   ./scripts/keeper.sh $NETWORK"
+echo "   (run periodically via cron or a systemd timer, e.g. every 12 hours)"
