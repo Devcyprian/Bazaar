@@ -550,6 +550,20 @@ Soroban RPC or Freighter wallet is required. Run in any environment.
 - [ ] Legal sign-off on sanctions/region restrictions ([record](docs/compliance/legal-signoff.md))
 - [ ] Review [incident runbook](docs/incidents/runbook.md) and confirm status page
 
+### CI/CD Environments
+
+The `main` branch pipeline deploys through two GitHub Environments
+(Settings → Environments):
+
+| Environment | Job | Protection | Secrets |
+|-------------|-----|------------|---------|
+| `testnet` | `deploy-testnet` | None — deploys automatically on push to `main` | Testnet `VERCEL_*` / `VITE_*` values |
+| `mainnet` | `deploy-mainnet` | Required reviewers — waits for manual approval | Mainnet `VERCEL_*` / `VITE_*` values |
+
+Store deploy secrets as environment secrets (not repository secrets) so each
+network only sees its own values. `deploy-mainnet` runs only after
+`deploy-testnet` succeeds.
+
 ### Deploy Contract (Mainnet)
 
 ```bash

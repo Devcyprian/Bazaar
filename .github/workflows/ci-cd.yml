@@ -363,12 +363,37 @@ jobs:
           VITE_NETWORK_PASSPHRASE: ${{ secrets.VITE_NETWORK_PASSPHRASE }}
           VITE_USDC_CONTRACT_ID: ${{ secrets.VITE_USDC_CONTRACT_ID }}
 
-  deploy-production:
-    name: Deploy Production
+  # Secrets below resolve from the job's GitHub Environment, so `testnet` and
+  # `mainnet` each hold their own VERCEL_* / VITE_* values. The `mainnet`
+  # environment is configured with required reviewers, so its job waits for
+  # manual approval; `testnet` has no protection rules and deploys
+  # automatically.
+  deploy-testnet:
+    name: Deploy Testnet
     needs: [contract-optimize, frontend-build]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    environment: production
+    environment: testnet
+    steps:
+      - name: Deploy to Vercel Production
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          vercel-args: '--prod'
+        env:
+          VITE_CONTRACT_ID: ${{ secrets.VITE_CONTRACT_ID }}
+          VITE_RPC_URL: ${{ secrets.VITE_RPC_URL }}
+          VITE_NETWORK_PASSPHRASE: ${{ secrets.VITE_NETWORK_PASSPHRASE }}
+          VITE_USDC_CONTRACT_ID: ${{ secrets.VITE_USDC_CONTRACT_ID }}
+
+  deploy-mainnet:
+    name: Deploy Mainnet
+    needs: deploy-testnet
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: mainnet
     steps:
       - name: Deploy to Vercel Production
         uses: amondnet/vercel-action@v25
