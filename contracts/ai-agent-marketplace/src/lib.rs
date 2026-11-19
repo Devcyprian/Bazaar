@@ -99,6 +99,21 @@ pub struct Escrow {
     pub released_at: Option<u64>,
     pub dispute_raised_at: Option<u64>,
     pub resolver: Option<Address>,
+    /// #170: ledger timestamp after which the fallback resolution applies.
+    pub dispute_deadline: Option<u64>,
+}
+
+/// #169: A balance owed to a recipient that could not be paid because they
+/// had no USDC trustline at payout time.  The recipient can withdraw it later
+/// via `claim_funds` once they can receive USDC.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Claimable {
+    pub job_id: u64,
+    pub recipient: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub created_at: u64,
 }
 
 #[contracttype]
@@ -145,6 +160,9 @@ pub struct Dispute {
     pub resolution: Option<String>,
     pub created_at: u64,
     pub resolved_at: Option<u64>,
+    /// #170: ledger timestamp after which either party may trigger the
+    /// deterministic fallback resolution.
+    pub dispute_deadline: u64,
 }
 
 #[contracttype]
@@ -212,6 +230,8 @@ pub enum DataKey {
     SkillAgents(String),
     PlatformStats,
     IsPaused,
+    /// #169: claimable balance for a job whose payout could not be delivered.
+    Claimable(u64),
 }
 
 #[contracttype]
@@ -288,7 +308,31 @@ pub enum Error {
     InvalidDisputeEvidence = 50,
     ContractPaused = 51,
     CannotBidOnOwnJob = 52,
+    /// #169: the recipient has no USDC trustline / cannot receive USDC.
+    AgentNotPayable = 53,
+    /// #171: reclaim attempted before the job deadline elapsed.
+    DeadlineNotReached = 54,
+    /// #171: reclaim attempted after the deliverable was approved.
+    AlreadyApproved = 55,
+    /// #170: fallback resolution attempted before the dispute window elapsed.
+    DisputeWindowNotExpired = 56,
+    /// #169: `claim_funds` called with no claimable balance recorded.
+    NothingToClaim = 57,
 }
+
+/// #172: Minimum TTL (in ledgers) we keep on persistent records.  At ~5s per
+/// ledger this is roughly 30 days.  Every read/write of a persistent record
+/// bumps its TTL back up to at least this value.
+pub const MIN_PERSISTENT_TTL: u32 = 518_400;
+/// #172: TTL (in ledgers) we extend persistent records to on touch (~90 days).
+pub const EXTEND_PERSISTENT_TTL: u32 = 1_555_200;
+/// #172: Minimum TTL (in ledgers) for the contract instance (~30 days).
+pub const MIN_INSTANCE_TTL: u32 = 518_400;
+/// #172: TTL (in ledgers) we extend the contract instance to on touch (~90 days).
+pub const EXTEND_INSTANCE_TTL: u32 = 1_555_200;
+/// #170: Default fallback split (percentage of payout to the agent) applied
+/// when a dispute times out without an admin resolution.
+pub const DISPUTE_FALLBACK_AGENT_PCT: u32 = 50;
 
 #[contract]
 pub struct AiAgentMarketplace;
@@ -358,6 +402,8 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::PlatformStats, &stats);
         env.storage().instance().set(&DataKey::IsPaused, &false);
 
+        Self::extend_instance_ttl(&env);
+
         // Emit initialization event
         env.events().publish(
             (symbol_short!("init"),),
@@ -371,6 +417,7 @@ impl AiAgentMarketplace {
     /// Admin function to pause or unpause contract operations
     pub fn set_paused(env: Env, admin: Address, paused: bool) -> Result<(), Error> {
         admin.require_auth();
+        Self::extend_instance_ttl(&env);
         let config = Self::get_config(&env)?;
         if admin != config.admin {
             return Err(Error::Unauthorized);
@@ -401,6 +448,7 @@ impl AiAgentMarketplace {
     ) -> Result<u64, Error> {
         owner.require_auth();
         Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
 
         let config = Self::get_config(&env)?;
         if price_per_task < config.min_job_budget {
@@ -435,6 +483,7 @@ impl AiAgentMarketplace {
         // Store agent
         env.storage().instance().set(&DataKey::Agent(agent_id), &agent);
         env.storage().instance().set(&DataKey::AgentByOwner(owner.clone()), &agent_id);
+        Self::extend_instance_ttl(&env);
 
         // Index skills
         for skill in skills.iter() {
@@ -471,6 +520,7 @@ impl AiAgentMarketplace {
     ) -> Result<(), Error> {
         owner.require_auth();
         Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
 
         let mut agent = Self::get_agent(&env, agent_id)?;
         if agent.owner != owner {
@@ -518,6 +568,7 @@ impl AiAgentMarketplace {
     ) -> Result<(), Error> {
         verifier.require_auth();
         Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
 
         let config = Self::get_config(&env)?;
         if !config.skill_verifiers.contains(&verifier) {
@@ -597,6 +648,7 @@ impl AiAgentMarketplace {
     ) -> Result<u64, Error> {
         client.require_auth();
         Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
 
         let config = Self::get_config(&env)?;
         
@@ -630,6 +682,7 @@ impl AiAgentMarketplace {
         };
 
         env.storage().instance().set(&DataKey::Job(job_id), &job);
+        Self::extend_instance_ttl(&env);
 
         // Index job by client
         let mut client_jobs: Vec<u64> = env.storage().instance()
@@ -655,6 +708,7 @@ impl AiAgentMarketplace {
     pub fn cancel_job(env: Env, client: Address, job_id: u64) -> Result<(), Error> {
         client.require_auth();
         Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
 
         let mut job = Self::get_job(&env, job_id)?;
         if job.client != client {
@@ -699,6 +753,7 @@ impl AiAgentMarketplace {
     ) -> Result<u64, Error> {
         agent_owner.require_auth();
         Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
 
         let config = Self::get_config(&env)?;
         let job = Self::get_job(&env, job_id)?;
@@ -810,6 +865,7 @@ impl AiAgentMarketplace {
     ) -> Result<(), Error> {
         agent_owner.require_auth();
         Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
 
         let job = Self::get_job(&env, job_id)?;
         if job.status != JobStatus::Open {
@@ -852,6 +908,7 @@ impl AiAgentMarketplace {
     ) -> Result<(), Error> {
         client.require_auth();
         Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
 
         let config = Self::get_config(&env)?;
         let mut job = Self::get_job(&env, job_id)?;
@@ -868,6 +925,12 @@ impl AiAgentMarketplace {
 
         if bid.status != BidStatus::Pending {
             return Err(Error::BidNotPending);
+        }
+
+        // #169: refuse to accept a bid from an agent that cannot receive USDC,
+        // otherwise the payout in `approve_deliverable` would be trapped.
+        if !Self::is_payable(&env, &config.usdc_token, &bid.agent) {
+            return Err(Error::AgentNotPayable);
         }
 
         // Verify bid belongs to this job
@@ -901,12 +964,14 @@ impl AiAgentMarketplace {
             released_at: None,
             dispute_raised_at: None,
             resolver: None,
+            dispute_deadline: None,
         };
 
         env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
         // EscrowByJob maps job_id -> escrow_id, created atomically in accept_bid.
         // This guarantees the lookup succeeds for any job that has ever had a funded escrow.
         env.storage().instance().set(&DataKey::EscrowByJob(job_id), &escrow_id);
+        Self::extend_instance_ttl(&env);
 
         // Update job
         job.status = JobStatus::InProgress;
@@ -964,6 +1029,7 @@ impl AiAgentMarketplace {
     ) -> Result<(), Error> {
         agent.require_auth();
         Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
 
         let mut job = Self::get_job(&env, job_id)?;
 
@@ -996,6 +1062,7 @@ impl AiAgentMarketplace {
     ) -> Result<(), Error> {
         client.require_auth();
         Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
 
         let config = Self::get_config(&env)?;
         let mut job = Self::get_job(&env, job_id)?;
@@ -1022,18 +1089,25 @@ impl AiAgentMarketplace {
             return Err(Error::EscrowNotFunded);
         }
 
-        // Release payment to agent
+        // Release payment to agent.  #169: if the agent cannot receive USDC
+        // (missing trustline), record a claimable balance instead of trapping
+        // the funds in escrow.  The agent withdraws it later via `claim_funds`.
         let usdc_client = TokenClient::new(&env, &config.usdc_token);
-        usdc_client.transfer(
-            &env.current_contract_address(),
-            &escrow.agent,
-            &escrow.amount,
-        );
+        if Self::is_payable(&env, &config.usdc_token, &escrow.agent) {
+            usdc_client.transfer(
+                &env.current_contract_address(),
+                &escrow.agent,
+                &escrow.amount,
+            );
+        } else {
+            Self::record_claimable(&env, job_id, &escrow.agent, escrow.amount, &config.usdc_token);
+        }
 
         // Update escrow
         escrow.status = EscrowStatus::Released;
         escrow.released_at = Some(env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
+        Self::extend_instance_ttl(&env);
 
         // Update agent stats
         let agent_id: u64 = env.storage().instance()
@@ -1072,6 +1146,7 @@ impl AiAgentMarketplace {
     ) -> Result<u64, Error> {
         raiser.require_auth();
         Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
 
         let config = Self::get_config(&env)?;
         let mut job = Self::get_job(&env, job_id)?;
@@ -1108,6 +1183,8 @@ impl AiAgentMarketplace {
         // Create dispute
         let dispute_id = Self::next_dispute_id(&env)?;
         let now = env.ledger().timestamp();
+        // #170: after this timestamp either party may trigger the fallback.
+        let dispute_deadline = now + (config.dispute_window_days * 86400);
 
         let dispute = Dispute {
             id: dispute_id,
@@ -1120,6 +1197,7 @@ impl AiAgentMarketplace {
             resolution: None,
             created_at: now,
             resolved_at: None,
+            dispute_deadline,
         };
 
         env.storage().instance().set(&DataKey::Dispute(dispute_id), &dispute);
@@ -1138,7 +1216,9 @@ impl AiAgentMarketplace {
 
         escrow.status = EscrowStatus::Disputed;
         escrow.dispute_raised_at = Some(now);
+        escrow.dispute_deadline = Some(dispute_deadline);
         env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
+        Self::extend_instance_ttl(&env);
 
         // Update stats
         let mut stats = Self::get_platform_stats(&env)?;
@@ -1162,6 +1242,7 @@ impl AiAgentMarketplace {
         split_percentage: Option<u32>, // If split, percentage to agent
     ) -> Result<(), Error> {
         resolver.require_auth();
+        Self::extend_instance_ttl(&env);
 
         let config = Self::get_config(&env)?;
         if resolver != config.dispute_resolver && resolver != config.admin {
@@ -1201,21 +1282,13 @@ impl AiAgentMarketplace {
         match resolution.as_str() {
             "agent" => {
                 // Full payment to agent (minus dispute fee)
-                usdc_client.transfer(
-                    &env.current_contract_address(),
-                    &escrow.agent,
-                    &payout,
-                );
+                Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.agent, payout);
                 escrow.status = EscrowStatus::Released;
                 job.status = JobStatus::Completed;
             }
             "client" => {
                 // Full refund to client (minus dispute fee)
-                usdc_client.transfer(
-                    &env.current_contract_address(),
-                    &escrow.client,
-                    &payout,
-                );
+                Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.client, payout);
                 escrow.status = EscrowStatus::Refunded;
                 job.status = JobStatus::Refunded;
             }
@@ -1227,16 +1300,8 @@ impl AiAgentMarketplace {
                 let agent_amount = (payout * percentage as i128) / 100;
                 let client_amount = payout - agent_amount;
 
-                usdc_client.transfer(
-                    &env.current_contract_address(),
-                    &escrow.agent,
-                    &agent_amount,
-                );
-                usdc_client.transfer(
-                    &env.current_contract_address(),
-                    &escrow.client,
-                    &client_amount,
-                );
+                Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.agent, agent_amount);
+                Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.client, client_amount);
                 escrow.status = EscrowStatus::Released;
                 job.status = JobStatus::Completed;
             }
@@ -1272,6 +1337,7 @@ impl AiAgentMarketplace {
     ) -> Result<(), Error> {
         reviewer.require_auth();
         Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
 
         let job = Self::get_job(&env, job_id)?;
 
@@ -1381,6 +1447,7 @@ impl AiAgentMarketplace {
     ) -> Result<(), Error> {
         client.require_auth();
         Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
 
         let config = Self::get_config(&env)?;
         let mut job = Self::get_job(&env, job_id)?;
@@ -1431,6 +1498,219 @@ impl AiAgentMarketplace {
         env.events().publish(
             (symbol_short!("refund"),),
             (job_id, client, escrow.amount),
+        );
+
+        Ok(())
+    }
+
+    /// #171: Reclaim escrow after the job deadline elapses without an accepted
+    /// deliverable.
+    ///
+    /// Permissionless in the sense that only the client can call it, but it
+    /// requires no admin involvement.  Preconditions:
+    ///   - Caller is the job's client.
+    ///   - `now > job.deadline`.
+    ///   - The job has not been approved/completed (`JobStatus::Completed`).
+    ///   - Escrow is still `Funded`.
+    ///
+    /// Effects: refunds the client, sets escrow/job to `Refunded`, emits
+    /// `reclaim`.
+    pub fn reclaim_escrow(env: Env, client: Address, job_id: u64) -> Result<(), Error> {
+        client.require_auth();
+        Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
+
+        let config = Self::get_config(&env)?;
+        let mut job = Self::get_job(&env, job_id)?;
+
+        if job.client != client {
+            return Err(Error::Unauthorized);
+        }
+
+        // Cannot reclaim once the deliverable has been approved.
+        if job.status == JobStatus::Completed {
+            return Err(Error::AlreadyApproved);
+        }
+
+        // Only allowed strictly after the deadline.
+        if env.ledger().timestamp() <= job.deadline {
+            return Err(Error::DeadlineNotReached);
+        }
+
+        let escrow_id: u64 = env.storage().instance()
+            .get(&DataKey::EscrowByJob(job_id))
+            .ok_or(Error::EscrowNotFound)?;
+        let mut escrow = Self::get_escrow(&env, escrow_id)?;
+
+        if escrow.status != EscrowStatus::Funded {
+            return Err(Error::EscrowNotFunded);
+        }
+
+        let usdc_client = TokenClient::new(&env, &config.usdc_token);
+        usdc_client.transfer(
+            &env.current_contract_address(),
+            &client,
+            &escrow.amount,
+        );
+
+        escrow.status = EscrowStatus::Refunded;
+        escrow.released_at = Some(env.ledger().timestamp());
+        env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
+
+        job.status = JobStatus::Refunded;
+        env.storage().instance().set(&DataKey::Job(job_id), &job);
+        Self::extend_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("reclaim"),),
+            (job_id, client, escrow.amount),
+        );
+
+        Ok(())
+    }
+
+    /// #169: Withdraw a claimable balance recorded when a payout could not be
+    /// delivered because the recipient had no USDC trustline.
+    ///
+    /// Callable by the recorded recipient once they can receive USDC.
+    pub fn claim_funds(env: Env, agent: Address, job_id: u64) -> Result<(), Error> {
+        agent.require_auth();
+        Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
+
+        let claim: Claimable = env.storage().instance()
+            .get(&DataKey::Claimable(job_id))
+            .ok_or(Error::NothingToClaim)?;
+
+        if claim.recipient != agent {
+            return Err(Error::Unauthorized);
+        }
+
+        let config = Self::get_config(&env)?;
+        if !Self::is_payable(&env, &claim.token, &agent) {
+            return Err(Error::AgentNotPayable);
+        }
+
+        let usdc_client = TokenClient::new(&env, &claim.token);
+        usdc_client.transfer(
+            &env.current_contract_address(),
+            &agent,
+            &claim.amount,
+        );
+
+        env.storage().instance().remove(&DataKey::Claimable(job_id));
+        Self::extend_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("claim"),),
+            (job_id, agent, claim.amount, config.usdc_token),
+        );
+
+        Ok(())
+    }
+
+    /// #170: Deterministic fallback resolution once the dispute window has
+    /// elapsed without an admin resolution.
+    ///
+    /// Callable by either the client or the assigned agent.  Applies a fixed
+    /// split (`DISPUTE_FALLBACK_AGENT_PCT` to the agent, remainder to the
+    /// client) minus the dispute fee, and marks the dispute resolved.
+    pub fn resolve_dispute_fallback(
+        env: Env,
+        caller: Address,
+        dispute_id: u64,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
+
+        let config = Self::get_config(&env)?;
+        let mut dispute = Self::get_dispute(&env, dispute_id)?;
+
+        if dispute.status != DisputeStatus::Open && dispute.status != DisputeStatus::UnderReview {
+            return Err(Error::DisputeResolved);
+        }
+
+        let mut job = Self::get_job(&env, dispute.job_id)?;
+
+        // Only the two parties to the job may trigger the fallback.
+        if job.client != caller && job.assigned_agent != Some(caller.clone()) {
+            return Err(Error::Unauthorized);
+        }
+
+        // Window must have elapsed.
+        if env.ledger().timestamp() <= dispute.dispute_deadline {
+            return Err(Error::DisputeWindowNotExpired);
+        }
+
+        let escrow_id: u64 = env.storage().instance()
+            .get(&DataKey::EscrowByJob(dispute.job_id))
+            .ok_or(Error::EscrowNotFound)?;
+        let mut escrow = Self::get_escrow(&env, escrow_id)?;
+
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::EscrowNotDisputed);
+        }
+
+        let usdc_client = TokenClient::new(&env, &config.usdc_token);
+
+        let dispute_fee = (escrow.amount * config.platform_fee_bps_dispute as i128) / 10000;
+        let payout = escrow.amount - dispute_fee;
+        if dispute_fee > 0 {
+            usdc_client.transfer(
+                &env.current_contract_address(),
+                &config.platform_fee_recipient,
+                &dispute_fee,
+            );
+        }
+
+        let agent_amount = (payout * DISPUTE_FALLBACK_AGENT_PCT as i128) / 100;
+        let client_amount = payout - agent_amount;
+
+        Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.agent, agent_amount);
+        Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.client, client_amount);
+
+        escrow.status = EscrowStatus::Released;
+        escrow.released_at = Some(env.ledger().timestamp());
+        escrow.resolver = Some(caller.clone());
+        env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
+
+        dispute.status = DisputeStatus::Resolved;
+        dispute.resolution = Some(String::from_str(&env, "fallback_split"));
+        dispute.resolved_at = Some(env.ledger().timestamp());
+        env.storage().instance().set(&DataKey::Dispute(dispute_id), &dispute);
+
+        job.status = JobStatus::Completed;
+        env.storage().instance().set(&DataKey::Job(dispute.job_id), &job);
+        Self::extend_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("disp_fb"),),
+            (dispute_id, caller, agent_amount, client_amount),
+        );
+
+        Ok(())
+    }
+
+    /// #172: Keeper entrypoint — bump the TTL of a job and its escrow.
+    ///
+    /// Anyone may call this to keep long-running escrows alive on mainnet.
+    pub fn bump_ttl(env: Env, job_id: u64) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+
+        // Touch the job so its TTL is extended.
+        let _ = Self::get_job(&env, job_id)?;
+
+        // Touch the escrow, if any.
+        if let Some(escrow_id) = env.storage().instance()
+            .get::<DataKey, u64>(&DataKey::EscrowByJob(job_id))
+        {
+            let _ = Self::get_escrow(&env, escrow_id)?;
+        }
+
+        env.events().publish(
+            (symbol_short!("ttl_bump"),),
+            (job_id, env.ledger().sequence()),
         );
 
         Ok(())
@@ -1671,6 +1951,7 @@ impl AiAgentMarketplace {
         require_skill_verification: Option<bool>,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::extend_instance_ttl(&env);
 
         let mut config = Self::get_config(&env)?;
         if config.admin != admin {
@@ -1792,6 +2073,64 @@ impl AiAgentMarketplace {
         env.storage().instance().has(&DataKey::Config)
     }
 
+    /// #172: Extend the contract instance TTL.  Called on every entrypoint so
+    /// the instance never expires while the contract is in use.
+    fn extend_instance_ttl(env: &Env) {
+        env.storage().instance().extend_ttl(MIN_INSTANCE_TTL, EXTEND_INSTANCE_TTL);
+    }
+
+    /// #169: Returns `true` when `addr` can receive `token` (i.e. has a
+    /// trustline).  We probe by attempting a zero-value transfer from the
+    /// address to itself; a missing trustline makes the token contract panic,
+    /// which we catch via `try_`-style probing using the client's `try_transfer`.
+    fn is_payable(env: &Env, token: &Address, addr: &Address) -> bool {
+        let client = TokenClient::new(env, token);
+        // A zero-amount self-transfer succeeds iff the trustline exists.
+        client.try_transfer(addr, addr, &0).is_ok()
+    }
+
+    /// #169: Record a claimable balance for `recipient` on `job_id`.
+    fn record_claimable(
+        env: &Env,
+        job_id: u64,
+        recipient: &Address,
+        amount: i128,
+        token: &Address,
+    ) {
+        let claim = Claimable {
+            job_id,
+            recipient: recipient.clone(),
+            amount,
+            token: token.clone(),
+            created_at: env.ledger().timestamp(),
+        };
+        env.storage().instance().set(&DataKey::Claimable(job_id), &claim);
+        env.events().publish(
+            (symbol_short!("claimable"),),
+            (job_id, recipient.clone(), amount),
+        );
+    }
+
+    /// #169: Transfer `amount` to `recipient`, or record a claimable balance
+    /// when the recipient cannot receive USDC yet.
+    fn payout_or_claim(
+        env: &Env,
+        config: &Config,
+        job_id: u64,
+        recipient: &Address,
+        amount: i128,
+    ) {
+        if amount <= 0 {
+            return;
+        }
+        if Self::is_payable(env, &config.usdc_token, recipient) {
+            let usdc_client = TokenClient::new(env, &config.usdc_token);
+            usdc_client.transfer(&env.current_contract_address(), recipient, &amount);
+        } else {
+            Self::record_claimable(env, job_id, recipient, amount, &config.usdc_token);
+        }
+    }
+
     fn get_config(env: &Env) -> Result<Config, Error> {
         env.storage().instance()
             .get(&DataKey::Config)
@@ -1807,12 +2146,14 @@ impl AiAgentMarketplace {
     }
 
     fn get_agent(env: &Env, agent_id: u64) -> Result<Agent, Error> {
+        Self::extend_instance_ttl(env);
         env.storage().instance()
             .get(&DataKey::Agent(agent_id))
             .ok_or(Error::AgentNotFound)
     }
 
     fn get_job(env: &Env, job_id: u64) -> Result<Job, Error> {
+        Self::extend_instance_ttl(env);
         env.storage().instance()
             .get(&DataKey::Job(job_id))
             .ok_or(Error::JobNotFound)

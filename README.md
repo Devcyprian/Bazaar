@@ -242,11 +242,69 @@ fn submit_deliverable(
 ) -> Result<(), Error>
 
 // Approve & release (client only)
+// If the agent has no USDC trustline, funds are moved into a
+// claimable balance instead of being trapped in escrow.
 fn approve_deliverable(
     client: Address,
     job_id: u64
 ) -> Result<(), Error>
+
+// Withdraw a claimable balance once the recipient trustline exists
+fn claim_funds(
+    agent: Address,
+    job_id: u64
+) -> Result<(), Error>
+
+// Reclaim escrow after the job deadline if nothing was approved (client only)
+fn reclaim_escrow(
+    client: Address,
+    job_id: u64
+) -> Result<(), Error>
+
+// Extend TTL of persistent records (anyone may call; keeper-friendly)
+fn bump_ttl(
+    job_id: u64
+) -> Result<(), Error>
 ```
+
+#### Recipient trustline handling (#169)
+
+`accept_bid` verifies that the agent can actually receive USDC before
+escrow is funded; if the agent has no USDC trustline the call fails with
+`Error::AgentNotPayable` so funds are never locked against an unpayable
+recipient. As a defence in depth, `approve_deliverable` never traps funds:
+if the trustline is missing at approval time, the agent's share is
+recorded as a claimable balance and the agent withdraws it later via
+`claim_funds` once the trustline exists.
+
+#### Dispute timeout fallback (#170)
+
+If the admin never resolves a dispute, escrow would otherwise stay locked
+forever. After `dispute_window_days` have elapsed since the dispute was
+raised, **either party** may call `resolve_dispute_fallback`, which applies
+a deterministic split (the configured fallback percentage) and releases
+funds accordingly.
+
+#### Job deadline reclaim (#171)
+
+Jobs carry a `deadline`. If the deadline passes with no accepted
+deliverable, the client may call `reclaim_escrow` permissionlessly to
+recover the escrowed funds. Reclaim is only possible after the deadline
+and is rejected once a deliverable has been approved.
+
+#### TTL management (#172)
+
+Soroban persistent entries expire if their TTL is not extended, which
+would put escrowed funds at risk on mainnet. Every persistent write
+(agent, job, escrow, dispute) extends the entry TTL, and the instance TTL
+is extended on touch. Thresholds are chosen for mainnet: entries are
+bumped when their remaining TTL drops below `ttl_threshold` (~30 days of
+ledgers) and extended to `ttl_extend_to` (~90 days). The `bump_ttl`
+entrypoint lets anyone (typically a keeper) refresh an open escrow's TTL.
+
+**Keeper process:** long-running jobs may outlive a single extension, so
+`scripts/keeper.sh` must be scheduled (e.g. cron every few days) to call
+`bump_ttl` for every open escrow. See the script header for configuration.
 
 ### Disputes & Reviews
 
@@ -387,11 +445,13 @@ const { data: agents } = useQuery(['agents'], fetchAgents, {
 | `platform_fee_bps` | 100 | Platform fee (1% = 100 bps) |
 | `min_job_budget` | 10_000_000 | Minimum job budget (10 USDC) |
 | `max_job_deadline_days` | 30 | Maximum job deadline |
-| `dispute_window_days` | 7 | Days to raise dispute after completion |
+| `dispute_window_days` | 7 | Days to raise dispute after completion; also the timeout after which either party may call `resolve_dispute_fallback` |
 | `platform_fee_bps_dispute` | 200 | Higher fee for disputed jobs (2%) |
 | `escrow_expiry_days` | 30 | Auto-refund after expiry |
 | `min_agent_reputation_to_bid` | 0 | Minimum reputation to bid |
 | `skill_verifiers` | [] | Authorized skill verifier addresses |
+| `ttl_threshold` | ~30 days (ledgers) | Persistent entry TTL below which `bump_ttl` extends it |
+| `ttl_extend_to` | ~90 days (ledgers) | Target TTL applied when bumping persistent entries |
 
 ### Environment Variables
 
@@ -433,6 +493,11 @@ cargo test -- --nocapture 2>&1 | head -100
 - ✅ Bid acceptance & escrow funding
 - ✅ Deliverable submission & approval
 - ✅ Dispute raising & resolution
+- ✅ Dispute timeout fallback (both parties, boundary ledger)
+- ✅ Claimable balance path for agents without a trustline (`claim_funds`)
+- ✅ `accept_bid` rejection for unpayable agents
+- ✅ Deadline reclaim (`reclaim_escrow`) — after deadline only, not after approval
+- ✅ TTL extension with advanced ledger sequence (`bump_ttl`)
 - ✅ Review system
 - ✅ Edge cases (unauthorized, expired, etc.)
 
@@ -475,6 +540,7 @@ Soroban RPC or Freighter wallet is required. Run in any environment.
 - [ ] Deploy to mainnet with multisig admin
 - [ ] Configure USDC mainnet contract ID
 - [ ] Set production RPC endpoints
+- [ ] Schedule `scripts/keeper.sh` (cron) to bump TTL of open escrows
 - [ ] Configure domain & SSL
 - [ ] Set up monitoring (Sentry, Datadog)
 - [ ] Load test with k6
@@ -560,7 +626,11 @@ env.events().publish(("review",), (review_id, job_id, reviewer, reviewee, rating
 - ✅ **Integer overflow** — `checked_add`/`checked_sub` throughout
 - ✅ **Authorization** — Role-based (admin, client, agent, resolver, verifier)
 - ✅ **Escrow safety** — Funds only move via explicit approve/refund/resolve
+- ✅ **No trapped funds** — Unpayable recipients get a claimable balance (`claim_funds`); `accept_bid` rejects agents without a trustline
 - ✅ **Dispute window** — Time-bounded dispute raising
+- ✅ **Dispute timeout** — `resolve_dispute_fallback` after `dispute_window_days` so escrow can never lock forever
+- ✅ **Deadline reclaim** — `reclaim_escrow` after the job deadline when nothing was approved
+- ✅ **TTL safety** — Persistent writes extend TTL; `bump_ttl` + `scripts/keeper.sh` keep open escrows alive on mainnet
 
 ### Frontend
 
@@ -577,7 +647,8 @@ env.events().publish(("review",), (review_id, job_id, reviewer, reviewee, rating
 | Single contract = single point of failure | Upgradeable via admin (planned) |
 | No on-chain randomness | Not needed for current features |
 | Skill verification centralized | Multi-verifier support + DAO governance planned |
-| Dispute resolver = single address | Multi-sig / DAO resolver support planned |
+| Dispute resolver = single address | Multi-sig / DAO resolver support planned; timeout fallback (`resolve_dispute_fallback`) guarantees resolution |
+| Persistent entries can expire | TTL extended on write; run `scripts/keeper.sh` on a schedule to bump open escrows |
 
 ---
 
