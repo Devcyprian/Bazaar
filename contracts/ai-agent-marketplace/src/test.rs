@@ -3370,6 +3370,351 @@ fn test_get_verifications_by_agent() {
     assert_eq!(marketplace.get_verifications_by_agent(&999u64).len(), 0);
 }
 
+// ==================== #102: initialize() requires admin auth ====================
+
+/// A front-runner cannot initialize the contract: `initialize` requires the
+/// admin's authorization, so a call made by anyone else (without the admin's
+/// signature) must fail.
+#[test]
+fn test_initialize_front_run_rejected() {
+    let e = Env::default();
+
+    let admin = Address::generate(&e);
+    let attacker = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+
+    let contract_id = e.register_contract(None, AiAgentMarketplace);
+    let client = AiAgentMarketplaceClient::new(&e, &contract_id);
+
+    // Only the attacker authorizes the call; the admin never signs.
+    e.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &attacker,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: (
+                admin.clone(),
+                usdc.address(),
+                100u32,
+                10_000_000i128,
+                30u32,
+                7u32,
+                0u32,
+                admin.clone(),
+                admin.clone(),
+                0u32,
+                200u32,
+                30u32,
+                Vec::<Address>::new(&e),
+                false,
+                1_000_000_000i128,
+                10_000_000_000i128,
+            )
+                .into_val(&e),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = client.try_initialize(
+        &admin,
+        &usdc.address(),
+        &100,
+        &10_000_000,
+        &30,
+        &7,
+        &0,
+        &admin,
+        &admin,
+        &0,
+        &200,
+        &30,
+        &Vec::new(&e),
+        &false,
+        &1_000_000_000,
+        &10_000_000_000,
+    );
+    assert!(result.is_err());
+
+    // The contract must remain uninitialized: a later legitimate initialize
+    // by the real admin still succeeds.
+    e.mock_all_auths();
+    client.initialize(
+        &admin,
+        &usdc.address(),
+        &100,
+        &10_000_000,
+        &30,
+        &7,
+        &0,
+        &admin,
+        &admin,
+        &0,
+        &200,
+        &30,
+        &Vec::new(&e),
+        &false,
+        &1_000_000_000,
+        &10_000_000_000,
+    );
+    assert_eq!(client.get_config().admin, admin);
+}
+
+/// With the admin's authorization, `initialize` succeeds.
+#[test]
+fn test_initialize_with_admin_auth_succeeds() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    assert_eq!(marketplace.get_config().admin, admin);
+}
+
+// ==================== #103 / #104: validate_config ====================
+
+/// Builds a valid `initialize` argument tuple, allowing a single field to be
+/// overridden so each invalid case can be exercised in isolation.
+fn init_args(
+    e: &Env,
+    admin: &Address,
+    usdc: &Address,
+    min_job_budget: i128,
+    max_job_deadline_days: u32,
+    dispute_window_days: u32,
+    escrow_expiry_days: u32,
+    platform_fee_bps: u32,
+    platform_fee_bps_dispute: u32,
+    min_agent_reputation: u32,
+    min_agent_reputation_to_bid: u32,
+) -> (
+    Address,
+    Address,
+    u32,
+    i128,
+    u32,
+    u32,
+    u32,
+    Address,
+    Address,
+    u32,
+    u32,
+    u32,
+    Vec<Address>,
+    bool,
+    i128,
+    i128,
+) {
+    (
+        admin.clone(),
+        usdc.clone(),
+        platform_fee_bps,
+        min_job_budget,
+        max_job_deadline_days,
+        dispute_window_days,
+        min_agent_reputation,
+        admin.clone(),
+        admin.clone(),
+        min_agent_reputation_to_bid,
+        platform_fee_bps_dispute,
+        escrow_expiry_days,
+        Vec::new(e),
+        false,
+        1_000_000_000,
+        10_000_000_000,
+    )
+}
+
+/// Table-driven: every invalid Config field is rejected by `initialize` with
+/// `InvalidConfig`.
+#[test]
+fn test_initialize_rejects_invalid_config_fields() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+
+    // (label, min_job_budget, max_days, dispute_window, escrow_expiry,
+    //  fee_bps, fee_bps_dispute, min_rep, min_rep_to_bid)
+    let cases: [(&str, i128, u32, u32, u32, u32, u32, u32, u32); 8] = [
+        ("min_job_budget=0", 0, 30, 7, 30, 100, 200, 0, 0),
+        ("max_job_deadline_days=0", 10_000_000, 0, 7, 30, 100, 200, 0, 0),
+        ("dispute_window_days=0", 10_000_000, 30, 0, 30, 100, 200, 0, 0),
+        ("escrow_expiry_days=0", 10_000_000, 30, 7, 0, 100, 200, 0, 0),
+        ("platform_fee_bps=10001", 10_000_000, 30, 7, 30, 10_001, 200, 0, 0),
+        ("platform_fee_bps_dispute=10001", 10_000_000, 30, 7, 30, 100, 10_001, 0, 0),
+        ("min_agent_reputation=101", 10_000_000, 30, 7, 30, 100, 200, 101, 0),
+        ("min_agent_reputation_to_bid=101", 10_000_000, 30, 7, 30, 100, 200, 0, 101),
+    ];
+
+    for (label, min_budget, max_days, dispute_window, escrow_expiry, fee, fee_dispute, min_rep, min_rep_bid) in
+        cases.iter()
+    {
+        let contract_id = e.register_contract(None, AiAgentMarketplace);
+        let client = AiAgentMarketplaceClient::new(&e, &contract_id);
+
+        let args = init_args(
+            &e,
+            &admin,
+            &usdc.address(),
+            *min_budget,
+            *max_days,
+            *dispute_window,
+            *escrow_expiry,
+            *fee,
+            *fee_dispute,
+            *min_rep,
+            *min_rep_bid,
+        );
+
+        let result = client.try_initialize(
+            &args.0, &args.1, &args.2, &args.3, &args.4, &args.5, &args.6, &args.7, &args.8,
+            &args.9, &args.10, &args.11, &args.12, &args.13, &args.14, &args.15,
+        );
+        assert_eq!(result, Err(Ok(Error::InvalidConfig)), "case: {}", label);
+    }
+}
+
+/// Table-driven: every invalid Config field is rejected by `update_config`
+/// with `InvalidConfig`, and the stored config is left unchanged.
+#[test]
+fn test_update_config_rejects_invalid_config_fields() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let before = marketplace.get_config();
+
+    // Each case sets exactly one field to an invalid value.
+    let cases: [(&str, u32, i128, u32, u32, u32, u32, u32, u32); 8] = [
+        ("min_job_budget=0", 0, 0, 0, 0, 0, 0, 0, 0),
+        ("max_job_deadline_days=0", 0, 0, 0, 0, 0, 0, 0, 0),
+        ("dispute_window_days=0", 0, 0, 0, 0, 0, 0, 0, 0),
+        ("escrow_expiry_days=0", 0, 0, 0, 0, 0, 0, 0, 0),
+        ("platform_fee_bps=10001", 0, 0, 0, 0, 0, 0, 0, 0),
+        ("platform_fee_bps_dispute=10001", 0, 0, 0, 0, 0, 0, 0, 0),
+        ("min_agent_reputation=101", 0, 0, 0, 0, 0, 0, 0, 0),
+        ("min_agent_reputation_to_bid=101", 0, 0, 0, 0, 0, 0, 0, 0),
+    ];
+
+    // Helper closure that issues update_config with a single field override.
+    let run = |label: &str,
+               fee: Option<u32>,
+               min_budget: Option<i128>,
+               max_days: Option<u32>,
+               dispute_window: Option<u32>,
+               min_rep: Option<u32>,
+               fee_dispute: Option<u32>,
+               escrow_expiry: Option<u32>,
+               min_rep_bid: Option<u32>| {
+        let result = marketplace.try_update_config(
+            &admin,
+            &fee,
+            &min_budget,
+            &max_days,
+            &dispute_window,
+            &min_rep,
+            &Option::None,
+            &Option::None,
+            &min_rep_bid,
+            &fee_dispute,
+            &escrow_expiry,
+            &Option::None,
+            &Option::None,
+            &Option::None,
+        );
+        assert_eq!(result, Err(Ok(Error::InvalidConfig)), "case: {}", label);
+        assert_eq!(marketplace.get_config(), before, "config changed: {}", label);
+    };
+
+    let _ = &cases;
+    run("min_job_budget=0", None, Some(0), None, None, None, None, None, None);
+    run("max_job_deadline_days=0", None, None, Some(0), None, None, None, None, None);
+    run("dispute_window_days=0", None, None, None, Some(0), None, None, None, None);
+    run("escrow_expiry_days=0", None, None, None, None, None, None, Some(0), None);
+    run("platform_fee_bps=10001", Some(10_001), None, None, None, None, None, None, None);
+    run("platform_fee_bps_dispute=10001", None, None, None, None, None, Some(10_001), None, None);
+    run("min_agent_reputation=101", None, None, None, None, Some(101), None, None, None);
+    run("min_agent_reputation_to_bid=101", None, None, None, None, None, None, None, Some(101));
+}
+
+/// Boundary values (10000 bps, reputation 100) are accepted by `initialize`.
+#[test]
+fn test_initialize_accepts_boundary_values() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+
+    let contract_id = e.register_contract(None, AiAgentMarketplace);
+    let client = AiAgentMarketplaceClient::new(&e, &contract_id);
+
+    client.initialize(
+        &admin,
+        &usdc.address(),
+        &10_000, // platform_fee_bps at max
+        &10_000_000,
+        &30,
+        &7,
+        &100, // min_agent_reputation at max
+        &admin,
+        &admin,
+        &100, // min_agent_reputation_to_bid at max
+        &10_000, // platform_fee_bps_dispute at max
+        &30,
+        &Vec::new(&e),
+        &false,
+        &1_000_000_000,
+        &10_000_000_000,
+    );
+
+    let config = client.get_config();
+    assert_eq!(config.platform_fee_bps, 10_000);
+    assert_eq!(config.platform_fee_bps_dispute, 10_000);
+    assert_eq!(config.min_agent_reputation, 100);
+    assert_eq!(config.min_agent_reputation_to_bid, 100);
+}
+
+/// Boundary values (10000 bps, reputation 100) are accepted by `update_config`.
+#[test]
+fn test_update_config_accepts_boundary_values() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    marketplace.update_config(
+        &admin,
+        &Option::Some(10_000u32),
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::Some(100u32),
+        &Option::None,
+        &Option::None,
+        &Option::Some(100u32),
+        &Option::Some(10_000u32),
+        &Option::None,
+        &Option::None,
+        &Option::None,
+        &Option::None,
+    );
+
+    let config = marketplace.get_config();
+    assert_eq!(config.platform_fee_bps, 10_000);
+    assert_eq!(config.platform_fee_bps_dispute, 10_000);
+    assert_eq!(config.min_agent_reputation, 100);
+    assert_eq!(config.min_agent_reputation_to_bid, 100);
+}
+
 // ==================== #106: DataKey variants are written and read ====================
 
 /// Every remaining `DataKey` variant must be reachable through a getter.
