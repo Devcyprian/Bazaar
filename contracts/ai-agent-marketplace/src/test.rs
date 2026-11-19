@@ -66,7 +66,6 @@ fn create_marketplace_contract<'a>(
         &10_000_000,    // min_job_budget (10 USDC)
         &30,            // max_job_deadline_days
         &7,             // dispute_window_days
-        &0,             // min_agent_reputation
         admin,
         admin,          // dispute_resolver
         &0,             // min_agent_reputation_to_bid
@@ -779,7 +778,6 @@ fn test_skill_verification() {
         &10_000_000,
         &30,
         &7,
-        &0,
         &admin,
         &admin,
         &0,
@@ -2736,7 +2734,6 @@ fn create_marketplace_with_verification_flag<'a>(
         &10_000_000,
         &30,
         &7,
-        &0,
         admin,
         admin,
         &0,
@@ -3215,6 +3212,216 @@ fn test_update_config_no_event_when_unchanged() {
         }
     }
     assert_eq!(config_events, 0);
+}
+
+// ==================== #107: get_disputes_by_job / get_open_dispute ====================
+
+/// Unknown job ids return an empty vec rather than panicking.
+#[test]
+fn test_get_disputes_by_job_unknown_job_returns_empty() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+    let marketplace = create_marketplace_contract(&e, &admin, &usdc.address());
+
+    let disputes = marketplace.get_disputes_by_job(&999u64);
+    assert_eq!(disputes.len(), 0);
+}
+
+/// A raised dispute is discoverable through the job index.
+#[test]
+fn test_get_disputes_by_job_returns_raised_dispute() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, _client, _agent, job_id, dispute_id) =
+        setup_disputed_job(&e);
+
+    let disputes = marketplace.get_disputes_by_job(&job_id);
+    assert_eq!(disputes.len(), 1);
+    assert_eq!(disputes.get(0).unwrap(), dispute_id);
+}
+
+/// `get_open_dispute` returns the open dispute id and `None` once resolved.
+#[test]
+fn test_get_open_dispute_lifecycle() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (marketplace, _usdc, _client, _agent, job_id, dispute_id) =
+        setup_disputed_job(&e);
+
+    // While open, the dispute is reported.
+    assert_eq!(marketplace.get_open_dispute(&job_id), Some(dispute_id));
+
+    // Unknown job -> None.
+    assert_eq!(marketplace.get_open_dispute(&999u64), None);
+
+    // After resolution, no open dispute remains.
+    let admin = marketplace.get_config().admin;
+    marketplace.resolve_dispute(
+        &admin,
+        &dispute_id,
+        &String::from_str(&e, "agent"),
+        &Option::None,
+    );
+    assert_eq!(marketplace.get_open_dispute(&job_id), None);
+}
+
+// ==================== #108: skill-verification getters ====================
+
+/// `get_verification` returns the stored struct and `None` for unknown ids.
+#[test]
+fn test_get_verification_roundtrip() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let verifier = Address::generate(&e);
+    let owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+
+    let marketplace = create_marketplace_with_verification_flag(
+        &e, &admin, &usdc.address(), &verifier, false,
+    );
+
+    let agent_id = marketplace.register_agent(
+        &owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &50_000_000,
+        &String::from_str(&e, "ipfs://QmTest"),
+    );
+
+    let expiry = e.ledger().timestamp() + 86_400 * 365;
+    marketplace.verify_skill(
+        &verifier,
+        &agent_id,
+        &String::from_str(&e, "python"),
+        &String::from_str(&e, "ipfs://QmProof"),
+        &expiry,
+    );
+
+    // Unknown verification id -> None.
+    assert!(marketplace.get_verification(&999u64).is_none());
+
+    // The stored verification carries verifier, evidence URI and expiry.
+    let verification = marketplace.get_verification(&1u64).unwrap();
+    assert_eq!(verification.agent_id, agent_id);
+    assert_eq!(verification.verifier, verifier);
+    assert_eq!(verification.evidence_uri, String::from_str(&e, "ipfs://QmProof"));
+    assert_eq!(verification.expires_at, expiry);
+}
+
+/// `get_verifications_by_agent` returns the agent's verifications and an
+/// empty vec for an agent with none.
+#[test]
+fn test_get_verifications_by_agent() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let verifier = Address::generate(&e);
+    let owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+
+    let marketplace = create_marketplace_with_verification_flag(
+        &e, &admin, &usdc.address(), &verifier, false,
+    );
+
+    let agent_id = marketplace.register_agent(
+        &owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [
+            String::from_str(&e, "python"),
+            String::from_str(&e, "rust"),
+        ]),
+        &50_000_000,
+        &String::from_str(&e, "ipfs://QmTest"),
+    );
+
+    // No verifications yet -> empty vec.
+    assert_eq!(marketplace.get_verifications_by_agent(&agent_id).len(), 0);
+
+    let expiry = e.ledger().timestamp() + 86_400 * 365;
+    marketplace.verify_skill(
+        &verifier,
+        &agent_id,
+        &String::from_str(&e, "python"),
+        &String::from_str(&e, "ipfs://QmProof1"),
+        &expiry,
+    );
+    marketplace.verify_skill(
+        &verifier,
+        &agent_id,
+        &String::from_str(&e, "rust"),
+        &String::from_str(&e, "ipfs://QmProof2"),
+        &expiry,
+    );
+
+    let verifications = marketplace.get_verifications_by_agent(&agent_id);
+    assert_eq!(verifications.len(), 2);
+
+    // Unknown agent -> empty vec.
+    assert_eq!(marketplace.get_verifications_by_agent(&999u64).len(), 0);
+}
+
+// ==================== #106: DataKey variants are written and read ====================
+
+/// Every remaining `DataKey` variant must be reachable through a getter.
+/// This exercises the previously-dead keys (AgentSkills, SkillVerification,
+/// SkillVerificationsByAgent, DisputesByJob) to prove they are both written
+/// and read.
+#[test]
+fn test_data_keys_are_written_and_read() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let verifier = Address::generate(&e);
+    let owner = Address::generate(&e);
+    let usdc = create_token_contract(&e);
+
+    let marketplace = create_marketplace_with_verification_flag(
+        &e, &admin, &usdc.address(), &verifier, false,
+    );
+
+    // AgentSkills: written by register_agent, read by get_agents_by_skill.
+    let agent_id = marketplace.register_agent(
+        &owner,
+        &String::from_str(&e, "Agent"),
+        &String::from_str(&e, "Desc"),
+        &Vec::from_array(&e, [String::from_str(&e, "python")]),
+        &50_000_000,
+        &String::from_str(&e, "ipfs://QmTest"),
+    );
+    let by_skill = marketplace.get_agents_by_skill(&String::from_str(&e, "python"), &0, &10);
+    assert_eq!(by_skill.len(), 1);
+    assert_eq!(by_skill.get(0).unwrap().id, agent_id);
+
+    // SkillVerification + SkillVerificationsByAgent: written by verify_skill,
+    // read by get_verification / get_verifications_by_agent.
+    let expiry = e.ledger().timestamp() + 86_400 * 365;
+    marketplace.verify_skill(
+        &verifier,
+        &agent_id,
+        &String::from_str(&e, "python"),
+        &String::from_str(&e, "ipfs://QmProof"),
+        &expiry,
+    );
+    assert!(marketplace.get_verification(&1u64).is_some());
+    assert_eq!(marketplace.get_verifications_by_agent(&agent_id).len(), 1);
+
+    // DisputesByJob: written by raise_dispute, read by get_disputes_by_job.
+    let (dispute_marketplace, _usdc, _client, _agent, job_id, dispute_id) =
+        setup_disputed_job(&e);
+    let disputes = dispute_marketplace.get_disputes_by_job(&job_id);
+    assert_eq!(disputes.len(), 1);
+    assert_eq!(disputes.get(0).unwrap(), dispute_id);
 }
 
 For `resolve_dispute` while paused - need to set up dispute, then pause, then resolve.
