@@ -9,6 +9,18 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+# Mainnet guardrail flag may appear anywhere in the argument list
+MAINNET_ACK=false
+ARGS=()
+for arg in "$@"; do
+    if [ "$arg" = "--i-understand-this-is-mainnet" ]; then
+        MAINNET_ACK=true
+    else
+        ARGS+=("$arg")
+    fi
+done
+set -- "${ARGS[@]}"
+
 # Configuration
 MODE="deploy"
 if [ "$1" = "upgrade" ] || [ "$1" = "--upgrade" ]; then
@@ -21,6 +33,14 @@ CONTRACT_ALIAS="ai-agent-marketplace"
 WASM_PATH="contracts/ai-agent-marketplace/target/wasm32-unknown-unknown/release/ai_agent_marketplace.wasm"
 # Source account used for upgrades (multisig admin)
 ADMIN_SOURCE=${ADMIN_SOURCE:-admin-multisig}
+# SHA-256 of the CI-built WASM artifact (required on mainnet)
+EXPECTED_WASM_HASH=${EXPECTED_WASM_HASH:-}
+
+# Save a log of this deployment
+LOG_DIR="deployments"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/deploy-$NETWORK-$(date -u +%Y%m%dT%H%M%SZ).log"
+exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo -e "${GREEN}🚀 AI Agent Marketplace Contract ${MODE^}${NC}"
 echo "Network: $NETWORK"
@@ -32,6 +52,19 @@ if [ "$NETWORK" = "mainnet" ] && [ "$SOURCE_ACCOUNT" = "deployer" ]; then
     echo -e "${RED}❌ Mainnet deploys must use the multisig admin account.${NC}"
     echo "Usage: $0 mainnet <multisig-admin-account>"
     exit 1
+fi
+
+# Mainnet safety: require an explicit acknowledgement flag and the CI artifact hash
+if [ "$NETWORK" = "mainnet" ]; then
+    if [ "$MAINNET_ACK" != true ]; then
+        echo -e "${RED}❌ Mainnet deploys require the --i-understand-this-is-mainnet flag.${NC}"
+        echo "Usage: EXPECTED_WASM_HASH=<ci-sha256> $0 mainnet <multisig-admin-account> --i-understand-this-is-mainnet"
+        exit 1
+    fi
+    if [ -z "$EXPECTED_WASM_HASH" ]; then
+        echo -e "${RED}❌ Set EXPECTED_WASM_HASH to the SHA-256 of the CI-built WASM artifact.${NC}"
+        exit 1
+    fi
 fi
 
 # Check prerequisites
@@ -72,6 +105,34 @@ fi
 LOCAL_WASM_HASH=$(sha256sum "$WASM_PATH" | awk '{print $1}')
 echo -e "${GREEN}🔑 Local WASM SHA-256: $LOCAL_WASM_HASH${NC}"
 
+# Print the resolved source account
+SOURCE_ADDRESS=$(stellar keys address "$SOURCE_ACCOUNT" 2>/dev/null || echo "$SOURCE_ACCOUNT")
+echo -e "${GREEN}👤 Source account: $SOURCE_ACCOUNT ($SOURCE_ADDRESS)${NC}"
+
+# Verify the local build matches the CI-built artifact
+if [ -n "$EXPECTED_WASM_HASH" ]; then
+    if [ "$LOCAL_WASM_HASH" != "$EXPECTED_WASM_HASH" ]; then
+        echo -e "${RED}❌ WASM hash does not match the CI-built artifact!${NC}"
+        echo "  Local: $LOCAL_WASM_HASH"
+        echo "  CI:    $EXPECTED_WASM_HASH"
+        exit 1
+    fi
+    echo -e "${GREEN}✅ WASM hash matches the CI-built artifact${NC}"
+fi
+
+# Mainnet safety: typed confirmation before anything is sent
+if [ "$NETWORK" = "mainnet" ]; then
+    echo ""
+    echo -e "${RED}⚠️  You are about to deploy to MAINNET.${NC}"
+    echo "  Source account: $SOURCE_ACCOUNT ($SOURCE_ADDRESS)"
+    echo "  WASM SHA-256:   $LOCAL_WASM_HASH"
+    read -r -p "Type 'deploy to mainnet' to continue: " CONFIRM
+    if [ "$CONFIRM" != "deploy to mainnet" ]; then
+        echo -e "${RED}❌ Confirmation did not match. Aborting.${NC}"
+        exit 1
+    fi
+fi
+
 # Deploy
 echo -e "${YELLOW}📤 Deploying to $NETWORK...${NC}"
 CONTRACT_ID=$(stellar contract deploy \
@@ -104,6 +165,7 @@ echo -e "${GREEN}📝 Contract ID saved to .contract-id-$NETWORK${NC}"
 
 echo ""
 echo -e "${GREEN}🎉 Deployment complete!${NC}"
+echo -e "${GREEN}📝 Deployment log saved to $LOG_FILE${NC}"
 echo ""
 echo -e "${YELLOW}📋 Post-deploy verification checklist (record results for the rehearsal):${NC}"
 echo "  [ ] Contract ID: $CONTRACT_ID"

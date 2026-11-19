@@ -536,7 +536,7 @@ Soroban RPC or Freighter wallet is required. Run in any environment.
 
 ### Production Checklist
 
-- [ ] Audit smart contract (recommended: Trail of Bits, Certora)
+- [ ] Audit smart contract (recommended: Trail of Bits, Certora) ([audit package & report](docs/audit/README.md))
 - [ ] Deploy to mainnet with multisig admin
 - [ ] Follow the [key management runbook](docs/mainnet/key-management.md) — mainnet admin key never stored in CI
 - [ ] Configure USDC mainnet contract ID
@@ -574,12 +574,10 @@ network only sees its own values. `deploy-mainnet` runs only after
 # Use multisig for admin
 stellar keys generate --global multisig-admin --network mainnet
 
-# Deploy with stellar-cli
-stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/ai_agent_marketplace.opt.wasm \
-  --source-account multisig-admin \
-  --network mainnet \
-  --alias ai-agent-marketplace-mainnet
+# Deploy (requires the explicit flag, a typed confirmation, and the
+# SHA-256 from the CI `contract-wasm` artifact's .sha256 file).
+# A log is saved to deployments/deploy-mainnet-<timestamp>.log
+EXPECTED_WASM_HASH=<sha256-from-ci> ./scripts/deploy-contract.sh mainnet multisig-admin --i-understand-this-is-mainnet
 
 # Initialize with production config
 ./scripts/init-contract.sh mainnet
@@ -768,6 +766,10 @@ owners and due dates.
 ---
 
 ## 🔐 Security
+
+See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for fund flows, trust assumptions, admin capabilities and mitigations.
+
+**External audit:** the audit package, findings tracker and final report are in [`docs/audit/`](docs/audit/README.md).
 
 ### Smart Contract
 =======

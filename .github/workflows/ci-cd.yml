@@ -72,6 +72,11 @@ jobs:
           cargo test --all pause
           cargo test --all upgrade
 
+      # Fails if any entrypoint exceeds 70% of the mainnet CPU or memory
+      # limits (see docs/BUDGETS.md).
+      - name: Budget regression check
+        run: cargo test --all budget -- --nocapture
+
   contract-optimize:
     name: Optimize WASM
     needs: contract-check
@@ -117,6 +122,13 @@ jobs:
             echo "::warning::WASM exceeds 1MB"
           fi
           
+      # deploy-contract.sh verifies mainnet builds against this hash
+      # (EXPECTED_WASM_HASH).
+      - name: Record WASM hash
+        run: |
+          cd target/wasm32-unknown-unknown/release
+          sha256sum ai_agent_marketplace.opt.wasm | tee ai_agent_marketplace.opt.wasm.sha256
+
       - name: Upload WASM artifact
         uses: actions/upload-artifact@v4
         with:
