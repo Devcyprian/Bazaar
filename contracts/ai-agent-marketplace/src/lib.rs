@@ -32,6 +32,12 @@ pub struct Agent {
     pub created_at: u64,
     pub skills_verified: Map<String, bool>,
     pub metadata_uri: String, // IPFS URI for agent details
+    /// #120: Sum of all review ratings (1-5) received by this agent.  Used to
+    /// derive `reputation` exactly, avoiding the rounding drift of a rolling
+    /// integer average.
+    pub rating_sum: u64,
+    /// #120: Number of reviews counted in `rating_sum`.
+    pub rating_count: u32,
 }
 
 #[contracttype]
@@ -50,6 +56,9 @@ pub struct Job {
     // via DataKey::BidsByJob(job_id).  Use get_bids_by_job() to fetch them.
     pub escrow_amount: i128,
     pub created_at: u64,
+    /// #112: ledger timestamp when a bid was accepted and work started.  Used
+    /// as the start of the dispute window for jobs that never completed.
+    pub accepted_at: Option<u64>,
     pub completed_at: Option<u64>,
     pub deliverable_hash: Option<BytesN<32>>,
     pub dispute_raised: bool,
@@ -170,7 +179,8 @@ pub struct Dispute {
     pub evidence_uri: String,
     pub status: DisputeStatus,
     pub resolver: Option<Address>,
-    pub resolution: Option<String>,
+    /// #110: typed resolution outcome (agent / client / split percentage).
+    pub resolution: Option<DisputeResolution>,
     pub created_at: u64,
     pub resolved_at: Option<u64>,
     /// #170: ledger timestamp after which either party may trigger the
@@ -187,6 +197,18 @@ pub enum DisputeStatus {
     Escalated,
 }
 
+/// #110: Typed dispute resolution.  Replaces the free-form `String` argument
+/// previously accepted by `resolve_dispute`, making invalid resolutions
+/// impossible at the type level.  `Split` carries the mandatory percentage of
+/// the payout (after fees) that goes to the agent.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DisputeResolution {
+    Agent,
+    Client,
+    Split(u32),
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -201,6 +223,12 @@ pub struct Config {
     pub min_agent_reputation_to_bid: u32,
     pub platform_fee_bps_dispute: u32, // Higher fee for disputes
     pub escrow_expiry_days: u64,
+    /// #115: Number of days after a dispute is raised before anyone may call
+    /// `claim_after_resolver_timeout` to apply the fallback resolution.
+    pub resolution_deadline_days: u64,
+    /// #115: Percentage of the (post-fee) payout sent to the agent when the
+    /// resolver times out.  The remainder is refunded to the client.
+    pub resolver_timeout_agent_pct: u32,
     pub skill_verifiers: Vec<Address>,
     /// When `true`, every required skill on a job must be verified on the
     /// bidding agent before the bid is accepted.  When `false`, unverified
@@ -224,6 +252,11 @@ pub struct Config {
     /// #129: Maximum number of bids a single job may accumulate.  Bounds the
     /// cost of `accept_bid`, which must mark every other bid as Rejected.
     pub max_bids_per_job: u32,
+    /// #119: Reputation assigned to a newly registered agent.  Defaults to 0.
+    /// Combined with the zero-completed-jobs exemption in `place_bid`, this
+    /// lets operators seed a starting reputation without blocking cold-start
+    /// agents.
+    pub starting_reputation: u32,
 }
 
 #[contracttype]
@@ -248,6 +281,8 @@ pub enum DataKey {
     EscrowByJob(u64),
     Review(u64),
     ReviewsByReviewee(Address),
+    /// #109: reviews written by a given reviewer.
+    ReviewsByReviewer(Address),
     /// #123: (job_id, reviewer) -> review_id, for O(1) duplicate checks.
     ReviewByJobReviewer(u64, Address),
     /// #121: Aggregated client reputation.
@@ -260,6 +295,10 @@ pub enum DataKey {
     PlatformStats,
     IsPaused,
     Denylist,
+    /// #116: Admin-managed set of dispute resolvers.
+    Resolvers,
+    /// #116: Monotonic counter used to round-robin disputes across resolvers.
+    ResolverCounter,
 }
 
 #[contracttype]
@@ -348,6 +387,12 @@ pub enum Error {
     InputTooLong = 54,
     /// Returned by `place_bid` when the bidding agent has been deactivated.
     AgentInactive = 55,
+    /// #111: Returned by `resolve_dispute` when the requested resolution
+    /// cannot be honored for the dispute's current state.
+    InvalidResolution = 56,
+    /// #111: Returned by `resolve_dispute` when a split percentage is greater
+    /// than 100.
+    InvalidSplit = 57,
 }
 
 /// #172: Minimum TTL (in ledgers) we keep on persistent records.  At ~5s per
@@ -368,13 +413,35 @@ pub const DISPUTE_FALLBACK_AGENT_PCT: u32 = 50;
 /// the storage cost per review.  Longer comments are rejected with
 /// `Error::InputTooLong`.
 pub const MAX_REVIEW_COMMENT_LEN: u32 = 500;
+/// #114: Maximum length, in bytes, of the free-form `reason` accepted by
+/// `raise_dispute`.  Longer reasons are rejected with
+/// `Error::DisputeTextTooLong`.
+pub const MAX_DISPUTE_REASON_LEN: u32 = 500;
+/// #114: Maximum length, in bytes, of the `evidence_uri` accepted by
+/// `raise_dispute`.  Longer URIs are rejected with
+/// `Error::DisputeTextTooLong`.
+pub const MAX_DISPUTE_EVIDENCE_URI_LEN: u32 = 256;
+/// #115: Default number of days after a dispute is raised before the fallback
+/// resolution may be triggered.
+pub const DEFAULT_RESOLUTION_DEADLINE_DAYS: u64 = 14;
+/// #115: Default percentage of the post-fee payout sent to the agent when the
+/// resolver times out (remainder refunded to the client).
+pub const DEFAULT_RESOLVER_TIMEOUT_AGENT_PCT: u32 = 50;
 
 #[contract]
 pub struct AiAgentMarketplace;
 
 #[contractimpl]
 impl AiAgentMarketplace {
-    /// Initialize the marketplace contract
+    /// Initialize the marketplace contract.
+    ///
+    /// #102: Requires authorization from `admin`.  Deployments MUST deploy and
+    /// initialize atomically (e.g. via the deploy script or a `__constructor`
+    /// where supported) so that a third party cannot front-run the
+    /// initialization and choose the admin, fee recipient, resolver and token.
+    ///
+    /// #103: All `Config` fields are validated via `validate_config` before
+    /// anything is persisted.  See that helper for the documented rules.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -391,12 +458,12 @@ impl AiAgentMarketplace {
         skill_verifiers: Vec<Address>,
         require_skill_verification: bool,
     ) -> Result<(), Error> {
+        // #102: the admin must authorize initialization.  This prevents a
+        // front-runner from initializing the contract with their own admin.
+        admin.require_auth();
+
         if Self::has_config(&env) {
             return Err(Error::AlreadyInitialized);
-        }
-
-        if platform_fee_bps > 10000 {
-            return Err(Error::InvalidConfig);
         }
 
         // #132: Verify the configured token is a 7-decimal Stellar Asset
@@ -425,6 +492,8 @@ impl AiAgentMarketplace {
             min_agent_reputation_to_bid,
             platform_fee_bps_dispute,
             escrow_expiry_days,
+            resolution_deadline_days: DEFAULT_RESOLUTION_DEADLINE_DAYS,
+            resolver_timeout_agent_pct: DEFAULT_RESOLVER_TIMEOUT_AGENT_PCT,
             skill_verifiers,
             require_skill_verification,
             // #105: bumped from 1 to 2 when the unused `min_agent_reputation`
@@ -434,7 +503,11 @@ impl AiAgentMarketplace {
             max_total_escrow,
             total_locked_escrow: 0,
             max_bids_per_job: DEFAULT_MAX_BIDS_PER_JOB,
+            starting_reputation: 0,
         };
+
+        // #103 / #104: validate every field before persisting.
+        Self::validate_config(&config)?;
 
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::AgentCounter, &0u64);
@@ -444,6 +517,12 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::DisputeCounter, &0u64);
         env.storage().instance().set(&DataKey::EscrowCounter, &0u64);
         env.storage().instance().set(&DataKey::VerificationCounter, &0u64);
+
+        // #116: seed the resolver set with the configured resolver.
+        let mut resolvers: Vec<Address> = Vec::new(&env);
+        resolvers.push_back(dispute_resolver.clone());
+        env.storage().instance().set(&DataKey::Resolvers, &resolvers);
+        env.storage().instance().set(&DataKey::ResolverCounter, &0u64);
 
         let stats = PlatformStats {
             total_agents: 0,
@@ -597,13 +676,17 @@ impl AiAgentMarketplace {
             description,
             skills: skills.clone(),
             price_per_task,
-            reputation: 0,
+            // #119: seed from config so cold-start agents are not blocked.
+            reputation: config.starting_reputation,
             total_jobs_completed: 0,
             total_earnings: 0,
             is_active: true,
             created_at: now,
             skills_verified: Map::new(&env),
             metadata_uri,
+            // #120: exact reputation inputs.
+            rating_sum: 0,
+            rating_count: 0,
         };
 
         // Store agent
@@ -892,6 +975,7 @@ impl AiAgentMarketplace {
             assigned_agent: None,
             escrow_amount: 0,
             created_at: now,
+            accepted_at: None,
             completed_at: None,
             deliverable_hash: None,
             dispute_raised: false,
@@ -929,7 +1013,7 @@ impl AiAgentMarketplace {
     /// Cancel an open job (client only)
     pub fn cancel_job(env: Env, client: Address, job_id: u64) -> Result<(), Error> {
         client.require_auth();
-        Self::ensure_not_paused(&env)?;
+        // #118: cancellation is a settlement-type call — allowed while paused.
         Self::extend_instance_ttl(&env);
 
         let mut job = Self::get_job(&env, job_id)?;
@@ -1007,7 +1091,12 @@ impl AiAgentMarketplace {
             return Err(Error::AgentInactive);
         }
 
-        if agent.reputation < config.min_agent_reputation_to_bid {
+        // #119: cold-start exemption.  Agents that have never completed a job
+        // are exempt from the minimum-reputation gate so they can earn their
+        // first review.  Once they complete a job, the gate applies normally.
+        if agent.total_jobs_completed > 0
+            && agent.reputation < config.min_agent_reputation_to_bid
+        {
             return Err(Error::AgentReputationTooLow);
         }
 
@@ -1096,7 +1185,7 @@ impl AiAgentMarketplace {
         bid_id: u64,
     ) -> Result<(), Error> {
         agent_owner.require_auth();
-        Self::ensure_not_paused(&env)?;
+        // #118: settlement-type call — allowed while paused.
         Self::extend_instance_ttl(&env);
 
         let job = Self::get_job(&env, job_id)?;
@@ -1218,6 +1307,9 @@ impl AiAgentMarketplace {
         job.status = JobStatus::InProgress;
         job.assigned_agent = Some(bid.agent.clone());
         job.escrow_amount = escrow_amount;
+        // #112: record when work started so the dispute window for jobs that
+        // never complete is measured from acceptance, not from posting.
+        job.accepted_at = Some(now);
         env.storage().instance().set(&DataKey::Job(job_id), &job);
 
         // Update bid status
@@ -1311,7 +1403,7 @@ impl AiAgentMarketplace {
         job_id: u64,
     ) -> Result<(), Error> {
         client.require_auth();
-        Self::ensure_not_paused(&env)?;
+        // #118: settlement-type call — allowed while paused.
         Self::extend_instance_ttl(&env);
 
         let config = Self::get_config(&env)?;
@@ -1350,30 +1442,9 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
         Self::extend_instance_ttl(&env);
 
-        // Release the locked-escrow accounting now that funds have left.
-        let mut updated_config = config.clone();
-        updated_config.total_locked_escrow =
-            (updated_config.total_locked_escrow - escrow.amount).max(0);
-        env.storage().instance().set(&DataKey::Config, &updated_config);
-
-        // Update agent stats
-        let agent_id: u64 = env.storage().instance()
-            .get(&DataKey::AgentByOwner(escrow.agent.clone()))
-            .ok_or(Error::AgentNotFound)?;
-        let mut agent = Self::get_agent(&env, agent_id)?;
-        agent.total_jobs_completed += 1;
-        agent.total_earnings += escrow.amount;
-        env.storage().instance().set(&DataKey::Agent(agent_id), &agent);
-
-        // Update job
-        job.status = JobStatus::Completed;
-        env.storage().instance().set(&DataKey::Job(job_id), &job);
-
-        // Update stats
-        let mut stats = Self::get_platform_stats(&env)?;
-        stats.avg_job_completion_time = (stats.avg_job_completion_time * stats.total_jobs + 
-            (env.ledger().timestamp() - job.created_at)) / (stats.total_jobs + 1);
-        env.storage().instance().set(&DataKey::PlatformStats, &stats);
+        // #117: shared finalization — credits agent stats, sets completed_at,
+        // updates platform stats and releases the locked-escrow accounting.
+        Self::finalize_job_payout(&env, job_id, &mut job, &escrow.agent, escrow.amount)?;
 
         // ----- Interactions: release payment to agent -----
         // #169: if the agent cannot receive USDC (missing trustline), record a
@@ -1407,7 +1478,7 @@ impl AiAgentMarketplace {
         evidence_uri: String,
     ) -> Result<u64, Error> {
         raiser.require_auth();
-        Self::ensure_not_paused(&env)?;
+        // #118: dispute entrypoint — allowed while paused.
         Self::extend_instance_ttl(&env);
 
         let config = Self::get_config(&env)?;
@@ -1417,7 +1488,11 @@ impl AiAgentMarketplace {
             return Err(Error::Unauthorized);
         }
 
-        if job.status == JobStatus::Disputed || job.status == JobStatus::Cancelled {
+        // #113: return the correct error per state.
+        if job.status == JobStatus::Cancelled {
+            return Err(Error::JobCancelled);
+        }
+        if job.status == JobStatus::Disputed {
             return Err(Error::AlreadyDisputed);
         }
 
@@ -1425,8 +1500,11 @@ impl AiAgentMarketplace {
             return Err(Error::AlreadyDisputed);
         }
 
-        // Check dispute window (measured from completion, falling back to creation)
-        let window_start = job.completed_at.unwrap_or(job.created_at);
+        // Check dispute window.  #112: measured from completion when the job
+        // completed, otherwise from bid acceptance (when work started), and
+        // only falling back to creation for jobs that were never accepted.
+        let window_start = job.completed_at
+            .unwrap_or_else(|| job.accepted_at.unwrap_or(job.created_at));
         let dispute_deadline = window_start + (config.dispute_window_days * 86400);
         if env.ledger().timestamp() > dispute_deadline {
             return Err(Error::DisputeWindowExpired);
@@ -1445,8 +1523,17 @@ impl AiAgentMarketplace {
         // Create dispute
         let dispute_id = Self::next_dispute_id(&env)?;
         let now = env.ledger().timestamp();
-        // #170: after this timestamp either party may trigger the fallback.
-        let dispute_deadline = now + (config.dispute_window_days * 86400);
+        // #115: after this timestamp anyone may trigger the fallback.
+        let dispute_deadline = now + (config.resolution_deadline_days * 86400);
+
+        // #116: assign a resolver round-robin from the admin-managed set.
+        let assigned_resolver = Self::assign_resolver(&env, &config)?;
+
+        // #114: hash the free-form text so the event payload stays constant.
+        let mut text = Bytes::new(&env);
+        text.append(&reason.clone().into());
+        text.append(&evidence_uri.clone().into());
+        let text_hash: BytesN<32> = env.crypto().sha256(&text).into();
 
         let dispute = Dispute {
             id: dispute_id,
@@ -1455,7 +1542,7 @@ impl AiAgentMarketplace {
             reason,
             evidence_uri,
             status: DisputeStatus::Open,
-            resolver: Some(config.dispute_resolver.clone()),
+            resolver: Some(assigned_resolver.clone()),
             resolution: None,
             created_at: now,
             resolved_at: None,
@@ -1479,6 +1566,7 @@ impl AiAgentMarketplace {
         escrow.status = EscrowStatus::Disputed;
         escrow.dispute_raised_at = Some(now);
         escrow.dispute_deadline = Some(dispute_deadline);
+        escrow.resolver = Some(assigned_resolver);
         env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
         Self::extend_instance_ttl(&env);
 
@@ -1492,9 +1580,10 @@ impl AiAgentMarketplace {
         client_stats.disputes = client_stats.disputes.saturating_add(1);
         env.storage().instance().set(&DataKey::ClientStats(job.client.clone()), &client_stats);
 
+        // #114: constant-size payload — only ids plus the text hash.
         env.events().publish(
             (symbol_short!("dispute"), job_id, raiser.clone()),
-            (dispute_id, job_id, raiser, dispute.reason.clone()),
+            (dispute_id, job_id, raiser, text_hash),
         );
 
         Ok(dispute_id)
@@ -1505,16 +1594,12 @@ impl AiAgentMarketplace {
         env: Env,
         resolver: Address,
         dispute_id: u64,
-        resolution: String, // "agent" | "client" | "split"
-        split_percentage: Option<u32>, // If split, percentage to agent
+        resolution: DisputeResolution,
     ) -> Result<(), Error> {
         resolver.require_auth();
         Self::extend_instance_ttl(&env);
 
         let config = Self::get_config(&env)?;
-        if resolver != config.dispute_resolver && resolver != config.admin {
-            return Err(Error::UnauthorizedResolver);
-        }
 
         let mut dispute = Self::get_dispute(&env, dispute_id)?;
 
@@ -1522,6 +1607,7 @@ impl AiAgentMarketplace {
             return Err(Error::DisputeResolved);
         }
 
+        // #116: only the assigned resolver (or the admin) may resolve.
         if dispute.resolver != Some(resolver.clone()) && resolver != config.admin {
             return Err(Error::UnauthorizedResolver);
         }
@@ -1541,47 +1627,51 @@ impl AiAgentMarketplace {
         // All validation above; all state writes below; token transfers last.
 
         // ----- Effects: write all state before any external call -----
-        let (agent_payout, client_payout) = match resolution.as_str() {
-            "agent" => {
+        let (agent_payout, client_payout) = match resolution.clone() {
+            DisputeResolution::Agent => {
                 escrow.status = EscrowStatus::Released;
-                job.status = JobStatus::Completed;
                 (payout, 0)
             }
-            "client" => {
+            DisputeResolution::Client => {
                 escrow.status = EscrowStatus::Refunded;
                 job.status = JobStatus::Refunded;
                 (0, payout)
             }
-            "split" => {
-                let percentage = split_percentage.unwrap_or(50);
+            DisputeResolution::Split(percentage) => {
+                // #111: the percentage is mandatory (carried by the enum) and
+                // validated with a dedicated error.
                 if percentage > 100 {
-                    return Err(Error::InvalidConfig);
+                    return Err(Error::InvalidSplit);
                 }
                 let agent_amount = (payout * percentage as i128) / 100;
                 let client_amount = payout - agent_amount;
                 escrow.status = EscrowStatus::Released;
-                job.status = JobStatus::Completed;
                 (agent_amount, client_amount)
             }
-            _ => return Err(Error::InvalidConfig),
         };
 
         escrow.resolver = Some(resolver.clone());
         escrow.released_at = Some(env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
 
-        // Release the locked-escrow accounting now that funds have left.
-        let mut updated_config = config.clone();
-        updated_config.total_locked_escrow =
-            (updated_config.total_locked_escrow - escrow.amount).max(0);
-        env.storage().instance().set(&DataKey::Config, &updated_config);
+        // #117: for agent/split outcomes, run the same finalization as
+        // `approve_deliverable` so agent stats, completion time and job status
+        // stay consistent.  For "client" the job is refunded, not completed.
+        if agent_payout > 0 {
+            Self::finalize_job_payout(&env, dispute.job_id, &mut job, &escrow.agent, agent_payout)?;
+        } else {
+            // Release the locked-escrow accounting now that funds have left.
+            let mut updated_config = config.clone();
+            updated_config.total_locked_escrow =
+                (updated_config.total_locked_escrow - escrow.amount).max(0);
+            env.storage().instance().set(&DataKey::Config, &updated_config);
+            env.storage().instance().set(&DataKey::Job(dispute.job_id), &job);
+        }
 
         dispute.status = DisputeStatus::Resolved;
-        dispute.resolution = Some(resolution);
+        dispute.resolution = Some(resolution.clone());
         dispute.resolved_at = Some(env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Dispute(dispute_id), &dispute);
-
-        env.storage().instance().set(&DataKey::Job(dispute.job_id), &job);
 
         // ----- Interactions: token transfers last -----
         let usdc_client = TokenClient::new(&env, &config.usdc_token);
@@ -1612,7 +1702,7 @@ impl AiAgentMarketplace {
         comment: String,
     ) -> Result<(), Error> {
         reviewer.require_auth();
-        Self::ensure_not_paused(&env)?;
+        // #118: review entrypoint — allowed while paused.
         Self::extend_instance_ttl(&env);
 
         let job = Self::get_job(&env, job_id)?;
@@ -1672,6 +1762,13 @@ impl AiAgentMarketplace {
         reviewee_reviews.push_back(review_id);
         env.storage().instance().set(&DataKey::ReviewsByReviewee(reviewee.clone()), &reviewee_reviews);
 
+        // #109: index review by its author so a user can list reviews they wrote.
+        let mut reviewer_reviews: Vec<u64> = env.storage().instance()
+            .get(&DataKey::ReviewsByReviewer(reviewer.clone()))
+            .unwrap_or(Vec::new(&env));
+        reviewer_reviews.push_back(review_id);
+        env.storage().instance().set(&DataKey::ReviewsByReviewer(reviewer.clone()), &reviewer_reviews);
+
         // #121: when the agent reviews the client, update the client's stats.
         if job.client != reviewer {
             let mut client_stats = Self::get_client_stats_internal(&env, &reviewee);
@@ -1686,15 +1783,13 @@ impl AiAgentMarketplace {
                 .get(&DataKey::AgentByOwner(reviewee.clone()))
                 .ok_or(Error::AgentNotFound)?;
             let mut agent = Self::get_agent(&env, agent_id)?;
-            // Reputation is a 0-100 rolling average of review ratings (1-5).
-            let prior_reviews = reviewee_reviews.len().saturating_sub(1) as u32;
-            let rating_score = rating * 20;
-            let new_reputation = if prior_reviews == 0 {
-                rating_score
-            } else {
-                (agent.reputation * prior_reviews + rating_score) / (prior_reviews + 1)
-            };
-            agent.reputation = new_reputation;
+            // #120: derive reputation exactly from the accumulated rating sum
+            // and count instead of a lossy rolling average.  Reputation is a
+            // 0-100 scale; round half up.
+            agent.rating_sum = agent.rating_sum.saturating_add(rating as u64);
+            agent.rating_count = agent.rating_count.saturating_add(1);
+            let count = agent.rating_count as u64;
+            agent.reputation = ((agent.rating_sum * 20 + count / 2) / count) as u32;
             env.storage().instance().set(&DataKey::Agent(agent_id), &agent);
         }
 
@@ -1730,7 +1825,7 @@ impl AiAgentMarketplace {
         job_id: u64,
     ) -> Result<(), Error> {
         client.require_auth();
-        Self::ensure_not_paused(&env)?;
+        // #118: refund entrypoint — allowed while paused.
         Self::extend_instance_ttl(&env);
 
         let config = Self::get_config(&env)?;
@@ -1812,7 +1907,7 @@ impl AiAgentMarketplace {
     /// `reclaim`.
     pub fn reclaim_escrow(env: Env, client: Address, job_id: u64) -> Result<(), Error> {
         client.require_auth();
-        Self::ensure_not_paused(&env)?;
+        // #118: refund entrypoint — allowed while paused.
         Self::extend_instance_ttl(&env);
 
         let config = Self::get_config(&env)?;
@@ -1875,7 +1970,7 @@ impl AiAgentMarketplace {
     /// Callable by the recorded recipient once they can receive USDC.
     pub fn claim_funds(env: Env, agent: Address, job_id: u64) -> Result<(), Error> {
         agent.require_auth();
-        Self::ensure_not_paused(&env)?;
+        // #118: settlement entrypoint — allowed while paused.
         Self::extend_instance_ttl(&env);
 
         let claim: Claimable = env.storage().instance()
@@ -1926,7 +2021,7 @@ impl AiAgentMarketplace {
         dispute_id: u64,
     ) -> Result<(), Error> {
         caller.require_auth();
-        Self::ensure_not_paused(&env)?;
+        // #118: dispute resolution entrypoint — allowed while paused.
         Self::extend_instance_ttl(&env);
 
         let config = Self::get_config(&env)?;
@@ -1973,7 +2068,7 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
 
         dispute.status = DisputeStatus::Resolved;
-        dispute.resolution = Some(String::from_str(&env, "fallback_split"));
+        dispute.resolution = Some(DisputeResolution::Split(DISPUTE_FALLBACK_AGENT_PCT));
         dispute.resolved_at = Some(env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Dispute(dispute_id), &dispute);
 
@@ -1999,6 +2094,157 @@ impl AiAgentMarketplace {
         );
 
         Ok(())
+    }
+
+    /// #115: Apply the fallback resolution once the resolver deadline has
+    /// elapsed without an admin/resolver decision.
+    ///
+    /// Permissionless: anyone may call this after `dispute.dispute_deadline`.
+    /// The post-fee payout is split per `config.resolver_timeout_agent_pct`
+    /// (agent) with the remainder refunded to the client, so the full escrow
+    /// amount is always accounted for.
+    pub fn claim_after_resolver_timeout(
+        env: Env,
+        caller: Address,
+        dispute_id: u64,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
+
+        let config = Self::get_config(&env)?;
+        let mut dispute = Self::get_dispute(&env, dispute_id)?;
+
+        if dispute.status != DisputeStatus::Open && dispute.status != DisputeStatus::UnderReview {
+            return Err(Error::DisputeResolved);
+        }
+
+        // Deadline must have elapsed.
+        if env.ledger().timestamp() <= dispute.dispute_deadline {
+            return Err(Error::ResolutionDeadlineNotReached);
+        }
+
+        let mut job = Self::get_job(&env, dispute.job_id)?;
+
+        let escrow_id: u64 = env.storage().instance()
+            .get(&DataKey::EscrowByJob(dispute.job_id))
+            .ok_or(Error::EscrowNotFound)?;
+        let mut escrow = Self::get_escrow(&env, escrow_id)?;
+
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::EscrowNotDisputed);
+        }
+
+        let dispute_fee = (escrow.amount * config.platform_fee_bps_dispute as i128) / 10000;
+        let payout = escrow.amount - dispute_fee;
+
+        let pct = config.resolver_timeout_agent_pct.min(100);
+        let agent_amount = (payout * pct as i128) / 100;
+        let client_amount = payout - agent_amount;
+
+        // ===== CHECKS-EFFECTS-INTERACTIONS =====
+        // All validation above; all state writes below; token transfers last.
+
+        // ----- Effects: write all state before any external call -----
+        escrow.status = EscrowStatus::Released;
+        escrow.released_at = Some(env.ledger().timestamp());
+        env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
+
+        // Release the locked-escrow accounting now that funds have left.
+        let mut updated_config = config.clone();
+        updated_config.total_locked_escrow =
+            (updated_config.total_locked_escrow - escrow.amount).max(0);
+        env.storage().instance().set(&DataKey::Config, &updated_config);
+
+        dispute.status = DisputeStatus::Resolved;
+        dispute.resolution = Some(String::from_str(&env, "resolver_timeout"));
+        dispute.resolved_at = Some(env.ledger().timestamp());
+        env.storage().instance().set(&DataKey::Dispute(dispute_id), &dispute);
+
+        job.status = JobStatus::Completed;
+        env.storage().instance().set(&DataKey::Job(dispute.job_id), &job);
+        Self::extend_instance_ttl(&env);
+
+        // ----- Interactions: token transfers last -----
+        let usdc_client = TokenClient::new(&env, &config.usdc_token);
+        if dispute_fee > 0 {
+            usdc_client.transfer(
+                &env.current_contract_address(),
+                &config.platform_fee_recipient,
+                &dispute_fee,
+            );
+        }
+        Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.agent, agent_amount);
+        Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.client, client_amount);
+
+        env.events().publish(
+            (symbol_short!("disp_to"), dispute.job_id, caller.clone()),
+            (dispute_id, caller, agent_amount, client_amount),
+        );
+
+        Ok(())
+    }
+
+    /// #116: Admin — add a dispute resolver to the managed set.
+    pub fn add_resolver(env: Env, admin: Address, resolver: Address) -> Result<(), Error> {
+        admin.require_auth();
+        Self::extend_instance_ttl(&env);
+
+        let config = Self::get_config(&env)?;
+        if config.admin != admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut resolvers: Vec<Address> = env.storage().instance()
+            .get(&DataKey::Resolvers)
+            .unwrap_or(Vec::new(&env));
+        if !resolvers.contains(&resolver) {
+            resolvers.push_back(resolver.clone());
+            env.storage().instance().set(&DataKey::Resolvers, &resolvers);
+        }
+
+        env.events().publish(
+            (symbol_short!("res_add"), admin),
+            resolver,
+        );
+
+        Ok(())
+    }
+
+    /// #116: Admin — remove a dispute resolver from the managed set.
+    pub fn remove_resolver(env: Env, admin: Address, resolver: Address) -> Result<(), Error> {
+        admin.require_auth();
+        Self::extend_instance_ttl(&env);
+
+        let config = Self::get_config(&env)?;
+        if config.admin != admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let resolvers: Vec<Address> = env.storage().instance()
+            .get(&DataKey::Resolvers)
+            .unwrap_or(Vec::new(&env));
+        let mut updated: Vec<Address> = Vec::new(&env);
+        for r in resolvers.iter() {
+            if r != resolver {
+                updated.push_back(r);
+            }
+        }
+        env.storage().instance().set(&DataKey::Resolvers, &updated);
+
+        env.events().publish(
+            (symbol_short!("res_rem"), admin),
+            resolver,
+        );
+
+        Ok(())
+    }
+
+    /// #116: Get the current dispute resolver set.
+    pub fn get_resolvers(env: Env) -> Vec<Address> {
+        env.storage().instance()
+            .get(&DataKey::Resolvers)
+            .unwrap_or(Vec::new(&env))
     }
 
     /// #172: Keeper entrypoint — bump the TTL of a job and its escrow.
@@ -2181,6 +2427,22 @@ impl AiAgentMarketplace {
         Self::paginate(&env, &all, offset, limit)
     }
 
+    /// #109: Get reviews written by a reviewer (paginated).
+    ///
+    /// Returns a slice of review IDs authored by `reviewer` starting at
+    /// `offset` with at most `limit` entries.
+    pub fn get_reviews_by_reviewer(
+        env: Env,
+        reviewer: Address,
+        offset: u64,
+        limit: u64,
+    ) -> Vec<u64> {
+        let all: Vec<u64> = env.storage().instance()
+            .get(&DataKey::ReviewsByReviewer(reviewer))
+            .unwrap_or(Vec::new(&env));
+        Self::paginate(&env, &all, offset, limit)
+    }
+
     /// Get reviews for an agent/user (paginated).
     ///
     /// Returns a slice of review IDs for the reviewee starting at `offset`
@@ -2281,14 +2543,15 @@ impl AiAgentMarketplace {
         agent_id.and_then(|id| Self::get_agent(&env, id).ok())
     }
 
-    /// Get the escrow funding a job, if any.
+    /// Get the escrow funding a job.
     ///
-    /// Returns `Some(Escrow)` when a bid has been accepted and escrow funded
-    /// for the job, otherwise `None`.
-    pub fn get_escrow_by_job(env: Env, job_id: u64) -> Option<Escrow> {
-        let escrow_id: Option<u64> = env.storage().instance()
-            .get(&DataKey::EscrowByJob(job_id));
-        escrow_id.and_then(|id| Self::get_escrow(&env, id).ok())
+    /// Returns `Err(Error::EscrowNotFound)` when no bid has been accepted for
+    /// the job yet (or the escrow record is missing).
+    pub fn get_escrow_by_job(env: Env, job_id: u64) -> Result<Escrow, Error> {
+        let escrow_id: u64 = env.storage().instance()
+            .get(&DataKey::EscrowByJob(job_id))
+            .ok_or(Error::EscrowNotFound)?;
+        Self::get_escrow(&env, escrow_id)
     }
 
     /// #121: Get aggregated reputation stats for a client.
@@ -2332,6 +2595,8 @@ impl AiAgentMarketplace {
         escrow_expiry_days: Option<u64>,
         skill_verifiers: Option<Vec<Address>>,
         require_skill_verification: Option<bool>,
+        resolution_deadline_days: Option<u64>,
+        resolver_timeout_agent_pct: Option<u32>,
     ) -> Result<(), Error> {
         admin.require_auth();
         Self::extend_instance_ttl(&env);
@@ -2344,9 +2609,6 @@ impl AiAgentMarketplace {
         // #126: emit one `config_upd` event per changed field, carrying
         // `(field_symbol, old_value, new_value)` so indexers need not refetch.
         if let Some(fee) = platform_fee_bps {
-            if fee > 10000 {
-                return Err(Error::InvalidConfig);
-            }
             if fee != config.platform_fee_bps {
                 env.events().publish(
                     (symbol_short!("config_upd"), symbol_short!("fee_bps")),
@@ -2427,6 +2689,27 @@ impl AiAgentMarketplace {
             }
             config.escrow_expiry_days = days;
         }
+        if let Some(days) = resolution_deadline_days {
+            if days != config.resolution_deadline_days {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("res_days")),
+                    (config.resolution_deadline_days, days),
+                );
+            }
+            config.resolution_deadline_days = days;
+        }
+        if let Some(pct) = resolver_timeout_agent_pct {
+            if pct > 100 {
+                return Err(Error::InvalidConfig);
+            }
+            if pct != config.resolver_timeout_agent_pct {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("res_pct")),
+                    (config.resolver_timeout_agent_pct, pct),
+                );
+            }
+            config.resolver_timeout_agent_pct = pct;
+        }
         if let Some(verifiers) = skill_verifiers {
             if verifiers != config.skill_verifiers {
                 env.events().publish(
@@ -2445,6 +2728,18 @@ impl AiAgentMarketplace {
             }
             config.require_skill_verification = flag;
         }
+        if let Some(rep) = starting_reputation {
+            if rep != config.starting_reputation {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("start_rep")),
+                    (config.starting_reputation, rep),
+                );
+            }
+            config.starting_reputation = rep;
+        }
+
+        // #103 / #104: validate the fully-applied config before persisting.
+        Self::validate_config(&config)?;
 
         env.storage().instance().set(&DataKey::Config, &config);
 
@@ -2516,6 +2811,45 @@ impl AiAgentMarketplace {
         env.storage().instance().has(&DataKey::Config)
     }
 
+    /// #103 / #104: Validate every `Config` field.
+    ///
+    /// Rules:
+    /// - `min_job_budget` must be strictly positive (`> 0`), otherwise
+    ///   zero-value jobs would be allowed through.
+    /// - `max_job_deadline_days`, `dispute_window_days` and
+    ///   `escrow_expiry_days` must be strictly positive (`> 0`); a zero
+    ///   deadline cap would make `post_job` always fail.
+    /// - `platform_fee_bps` and `platform_fee_bps_dispute` must be within
+    ///   `0..=10000` basis points (0% to 100%).
+    /// - `min_agent_reputation_to_bid` must be within `0..=100` because
+    ///   reputation is stored as a 0-100 score (rating * 20).
+    ///
+    /// Returns `Error::InvalidConfig` when any rule is violated.
+    fn validate_config(config: &Config) -> Result<(), Error> {
+        if config.min_job_budget <= 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if config.max_job_deadline_days == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if config.dispute_window_days == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if config.escrow_expiry_days == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if config.platform_fee_bps > 10000 {
+            return Err(Error::InvalidConfig);
+        }
+        if config.platform_fee_bps_dispute > 10000 {
+            return Err(Error::InvalidConfig);
+        }
+        if config.min_agent_reputation_to_bid > 100 {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
+    }
+
     /// #172: Extend the contract instance TTL.  Called on every entrypoint so
     /// the instance never expires while the contract is in use.
     fn extend_instance_ttl(env: &Env) {
@@ -2574,10 +2908,75 @@ impl AiAgentMarketplace {
         }
     }
 
+    /// #117: Shared finalization for a job whose escrow is being paid out to
+    /// the agent (either via `approve_deliverable` or a dispute resolved in
+    /// the agent's favour / split).  Credits the agent's earnings and completed
+    /// job count, marks the job `Completed` with a `completed_at` timestamp,
+    /// updates the platform's average completion time, and releases the
+    /// locked-escrow accounting.  Callers must have already updated the escrow
+    /// record before invoking this.
+    fn finalize_job_payout(
+        env: &Env,
+        job_id: u64,
+        job: &mut Job,
+        agent_owner: &Address,
+        agent_amount: i128,
+    ) -> Result<(), Error> {
+        let now = env.ledger().timestamp();
+
+        // Update agent stats.
+        let agent_id: u64 = env.storage().instance()
+            .get(&DataKey::AgentByOwner(agent_owner.clone()))
+            .ok_or(Error::AgentNotFound)?;
+        let mut agent = Self::get_agent(env, agent_id)?;
+        agent.total_jobs_completed = agent.total_jobs_completed.saturating_add(1);
+        agent.total_earnings += agent_amount;
+        env.storage().instance().set(&DataKey::Agent(agent_id), &agent);
+
+        // Update job: mark completed and stamp the completion time.
+        job.status = JobStatus::Completed;
+        if job.completed_at.is_none() {
+            job.completed_at = Some(now);
+        }
+        env.storage().instance().set(&DataKey::Job(job_id), job);
+
+        // Update platform stats (average completion time).
+        let mut stats = Self::get_platform_stats(env)?;
+        let elapsed = now.saturating_sub(job.created_at);
+        stats.avg_job_completion_time =
+            (stats.avg_job_completion_time * stats.total_jobs + elapsed) / (stats.total_jobs + 1);
+        env.storage().instance().set(&DataKey::PlatformStats, &stats);
+
+        // Release the locked-escrow accounting now that funds have left.
+        let mut config = Self::get_config(env)?;
+        config.total_locked_escrow = (config.total_locked_escrow - job.escrow_amount).max(0);
+        env.storage().instance().set(&DataKey::Config, &config);
+
+        Self::extend_instance_ttl(env);
+        Ok(())
+    }
+
     fn get_config(env: &Env) -> Result<Config, Error> {
         env.storage().instance()
             .get(&DataKey::Config)
             .ok_or(Error::NotInitialized)
+    }
+
+    /// #116: Pick the next resolver round-robin from the managed set, falling
+    /// back to `config.dispute_resolver` when the set is empty.
+    fn assign_resolver(env: &Env, config: &Config) -> Result<Address, Error> {
+        let resolvers: Vec<Address> = env.storage().instance()
+            .get(&DataKey::Resolvers)
+            .unwrap_or(Vec::new(env));
+        if resolvers.is_empty() {
+            return Ok(config.dispute_resolver.clone());
+        }
+        let counter: u64 = env.storage().instance()
+            .get(&DataKey::ResolverCounter)
+            .unwrap_or(0);
+        let idx = (counter % resolvers.len() as u64) as u32;
+        env.storage().instance().set(&DataKey::ResolverCounter, &(counter + 1));
+        resolvers.get(idx).ok_or(Error::ResolverNotFound)
     }
 
     fn ensure_not_paused(env: &Env) -> Result<(), Error> {

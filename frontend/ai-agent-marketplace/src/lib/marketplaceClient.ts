@@ -225,6 +225,8 @@ const CONTRACT_ERROR_NAMES: Record<number, string> = {
   51: 'ContractPaused',
   52: 'CannotBidOnOwnJob',
   53: 'AddressBlocked',
+  54: 'InvalidResolution',
+  55: 'InvalidSplit',
 };
 
 /** Human-readable text for each contract `Error` variant. */
@@ -283,6 +285,8 @@ const CONTRACT_ERROR_MESSAGES: Record<string, string> = {
   ContractPaused: 'The marketplace is temporarily paused.',
   CannotBidOnOwnJob: 'You cannot bid on your own job.',
   AddressBlocked: 'This wallet address is blocked by compliance policy.',
+  InvalidResolution: 'The dispute resolution is invalid.',
+  InvalidSplit: 'The split percentage is invalid (must be between 0 and 100).',
 };
 
 /** Readable message for a contract `Error` variant name or numeric code. */
@@ -394,6 +398,68 @@ function mapEscrow(raw: Native): Escrow {
     disputeRaisedAt: optionVal<number>(raw.dispute_raised_at, toNum),
     resolver: optionVal<string>(raw.resolver, toStr),
   };
+}
+
+/**
+ * Dispute resolution chosen by the resolver. Encoded on-chain as the
+ * `DisputeResolution` enum: `Agent`, `Client`, or `Split(percentage)`.
+ */
+export type DisputeResolution =
+  | { type: 'Agent' }
+  | { type: 'Client' }
+  | { type: 'Split'; percentage: number };
+
+/** Encode a `DisputeResolution` as the contract's enum ScVal. */
+function encodeDisputeResolution(resolution: DisputeResolution): xdr.ScVal {
+  switch (resolution.type) {
+    case 'Agent':
+      return nativeToScVal({ Agent: undefined }, { type: 'enum' });
+    case 'Client':
+      return nativeToScVal({ Client: undefined }, { type: 'enum' });
+    case 'Split': {
+      const pct = resolution.percentage;
+      if (!Number.isInteger(pct) || pct < 0 || pct > 100) {
+        throw new Error(contractErrorMessage('InvalidSplit'));
+      }
+      return nativeToScVal({ Split: pct }, { type: 'enum' });
+    }
+    default:
+      throw new Error(contractErrorMessage('InvalidResolution'));
+  }
+}
+
+/**
+ * Decode a `DisputeResolution` enum value. Handles the `[u32, Symbol, ...]`
+ * shape, a plain variant string, or an object keyed by the variant name.
+ */
+function mapDisputeResolution(v: Native): DisputeResolution {
+  if (v && typeof v === 'object' && !Array.isArray(v) && !(v instanceof Map)) {
+    if ('Split' in v) {
+      return { type: 'Split', percentage: toNum((v as Native).Split) };
+    }
+    if ('Agent' in v) return { type: 'Agent' };
+    if ('Client' in v) return { type: 'Client' };
+  }
+  if (v instanceof Map) {
+    const m = v as Map<Native, Native>;
+    if (m.has('Split')) return { type: 'Split', percentage: toNum(m.get('Split')) };
+    if (m.has('Agent')) return { type: 'Agent' };
+    if (m.has('Client')) return { type: 'Client' };
+  }
+  if (Array.isArray(v)) {
+    const name = enumVal(v);
+    if (name === 'Split') {
+      const payload = v.find((el) => typeof el === 'number' || typeof el === 'bigint');
+      return { type: 'Split', percentage: toNum(payload) };
+    }
+    if (name === 'Agent') return { type: 'Agent' };
+    if (name === 'Client') return { type: 'Client' };
+  }
+  if (typeof v === 'string') {
+    if (v === 'Agent') return { type: 'Agent' };
+    if (v === 'Client') return { type: 'Client' };
+  }
+  throw new Error(contractErrorMessage('InvalidResolution'));
 }
 
 function mapPaymentRecord(raw: Native): PaymentRecord {
@@ -543,24 +609,17 @@ export class MarketplaceClient {
     unwrapResult(raw);
   }
 
-  /**
-   * Leave a review for the counterparty of a completed job.
-   * `rating` must be 1-5; `comment` is free-form text.
-   * Returns the new review id.
-   */
-  async leaveReview(
+  async resolveDispute(
     publicKey: string,
     signTransaction: SignFn,
-    params: { jobId: number; rating: number; comment: string },
-  ): Promise<number> {
+    jobId: number,
+    resolution: DisputeResolution,
+  ): Promise<void> {
     const raw = await this.send(
-      'leave_review', publicKey, signTransaction,
-      addr(publicKey),
-      u64(params.jobId),
-      nativeToScVal(params.rating, { type: 'u32' }),
-      str(params.comment),
+      'resolve_dispute', publicKey, signTransaction,
+      addr(publicKey), u64(jobId), encodeDisputeResolution(resolution),
     );
-    return toNum(unwrapResult(raw));
+    unwrapResult(raw);
   }
 
   // ── compliance: denylist (admin-managed, no redeploy) ─────────────────────
@@ -670,6 +729,12 @@ export class MarketplaceClient {
     );
   }
 
+  async getReviewsByReviewer(reviewer: string, offset: number, limit: number): Promise<number[]> {
+    return toIdArray(
+      await this.call('get_reviews_by_reviewer', addr(reviewer), u64(offset), u64(limit)),
+    );
+  }
+
   async getAgentsBySkill(skill: string, offset: number, limit: number): Promise<number[]> {
     return toIdArray(await this.call('get_agents_by_skill', str(skill), u64(offset), u64(limit)));
   }
@@ -739,25 +804,10 @@ export class MarketplaceClient {
     return Promise.all(ids.map((id) => this.getReview(id)));
   }
 
-  /** Fetch every review left for `reviewee` (paginated on-chain). */
-  async getReviewsForReviewee(
-    reviewee: string,
-    offset: number,
-    limit: number,
-  ): Promise<Review[]> {
-    const ids = await this.getReviewsByReviewee(reviewee, offset, limit);
+  /** Fetch the full review records written by `reviewer`. */
+  async getReviewsWrittenBy(reviewer: string, offset: number, limit: number): Promise<Review[]> {
+    const ids = await this.getReviewsByReviewer(reviewer, offset, limit);
     return this.getReviewsByIds(ids);
-  }
-
-  /**
-   * Resolve the review (if any) left by `reviewer` for a given job.
-   * Returns `null` when the reviewer has not reviewed the job yet.
-   */
-  async getReviewForJob(jobId: number, reviewer: string): Promise<Review | null> {
-    const ids = await this.getReviewsByReviewee(reviewer, 0, 1000);
-    if (ids.length === 0) return null;
-    const reviews = await this.getReviewsByIds(ids);
-    return reviews.find((r) => r.jobId === jobId) ?? null;
   }
 }
 

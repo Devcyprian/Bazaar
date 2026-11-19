@@ -50,6 +50,38 @@ export interface PaginatedResult<T> {
 
 export type EscrowStatus = 'Funded' | 'Released' | 'Disputed' | 'Refunded';
 
+/**
+ * Outcome of a dispute, mirroring the on-chain `DisputeResolution` enum.
+ *
+ * - `Agent`  — the full escrow is released to the agent.
+ * - `Client` — the full escrow is refunded to the client.
+ * - `Split`  — the escrow is split; `percentage` is the agent's share
+ *   (0–100), the remainder goes to the client.
+ *
+ * Modelled as a discriminated union so an invalid resolution is impossible at
+ * the type level.
+ */
+export type DisputeResolution =
+  | { kind: 'Agent' }
+  | { kind: 'Client' }
+  | { kind: 'Split'; percentage: number };
+
+/**
+ * A dispute raised against a job's escrow, mirroring the on-chain `Dispute`
+ * struct. `resolution` is `null` until an admin resolves the dispute.
+ */
+export interface Dispute {
+  jobId: number;
+  raisedBy: string;
+  reason: string;
+  /** Unix timestamp (seconds) the dispute was raised. */
+  raisedAt: number;
+  /** Resolution outcome, or `null` while the dispute is still open. */
+  resolution: DisputeResolution | null;
+  /** Unix timestamp (seconds) the dispute was resolved, or `null`. */
+  resolvedAt: number | null;
+}
+
 export interface Agent {
   id: number;
   owner: string;
@@ -104,6 +136,12 @@ export interface Job {
    */
   escrowStatus: EscrowStatus | null;
   createdAt: number;
+  /**
+   * Unix timestamp (seconds) the bid was accepted and the job moved to
+   * `InProgress`. Used as the start of the dispute window for jobs that never
+   * completed. `null` while the job is still `Open`.
+   */
+  acceptedAt: number | null;
   completedAt: number | null;
   deliverableHash: string | null;
   disputeRaised: boolean;

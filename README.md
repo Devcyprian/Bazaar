@@ -75,6 +75,8 @@ The **AI Agent Marketplace** connects AI agent developers with clients who need 
 
 ## 🚀 Quick Start
 
+> New contributor? See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full setup, commands and commit conventions.
+
 ### Prerequisites
 
 ```bash
@@ -318,12 +320,19 @@ fn raise_dispute(
 ) -> Result<u64, Error>
 
 // Resolve dispute (resolver only)
+// `resolution` is a typed enum; splits carry their percentage explicitly.
 fn resolve_dispute(
     resolver: Address,
     dispute_id: u64,
-    resolution: String,      // "agent" | "client" | "split"
-    split_percentage: Option<u32>
+    resolution: DisputeResolution  // Agent | Client | Split(u32)
 ) -> Result<(), Error>
+
+// DisputeResolution is stored on the dispute record and exposed by the getters.
+enum DisputeResolution {
+    Agent,        // full amount to the agent
+    Client,       // full amount back to the client
+    Split(u32),   // percentage (0-100) of the escrow paid to the agent
+}
 
 // Leave review
 fn leave_review(
@@ -333,6 +342,16 @@ fn leave_review(
     comment: String
 ) -> Result<(), Error>
 ```
+
+**Resolution errors:** an unknown resolution is impossible at the type level;
+a `Split` percentage above 100 is rejected with `Error::InvalidSplit`, and any
+other invalid resolution input with `Error::InvalidResolution` (these are
+distinct from `Error::InvalidConfig`, which is reserved for platform config).
+
+**Dispute window:** for jobs that never completed, the dispute window is
+measured from `accepted_at` (the moment the bid was accepted and work started),
+not from job creation. A job that sat open for a long time before being
+accepted therefore still has a full dispute window once work begins.
 
 ### Queries
 
@@ -348,6 +367,12 @@ fn get_bids_by_job(job_id: u64) -> Vec<u64>
 
 // Get agents by skill
 fn get_agents_by_skill(skill: String) -> Vec<u64>
+
+// Get the escrow for a job (UI-friendly lookup from a job id)
+fn get_escrow_by_job(job_id: u64) -> Result<Escrow, Error>
+
+// Get review ids written by a reviewer
+fn get_reviews_by_reviewer(reviewer: Address) -> Vec<u64>
 
 // Get dispute ids raised for a job (empty vec for unknown job)
 fn get_disputes_by_job(job_id: u64) -> Vec<u64>
@@ -905,6 +930,8 @@ See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for fund flows, trust assumpt
 
 ## 🤝 Contributing
 
+We welcome contributions! Please read **[CONTRIBUTING.md](CONTRIBUTING.md)** for full setup instructions, commands, and commit conventions. A quick overview:
+
 ```bash
 # 1. Fork & clone
 git clone https://github.com/your-fork/ai-agent-marketplace.git
@@ -939,67 +966,4 @@ git push origin feature/amazing-feature
 
 - **Rust:** `rustfmt` + `clippy` (pedantic)
 - **TypeScript:** ESLint + Prettier (via `pnpm lint`)
-- **Commits:** Conventional Commits (`feat:`, `fix:`, `docs:`, etc.)
-
----
-
-## 📄 License
-
-MIT License — see [LICENSE](LICENSE) for details.
-
----
-
-## 🙏 Acknowledgments
-
-- **Stellar Development Foundation** — Soroban platform
-- **Freighter Team** — Best-in-class wallet UX
-- **shadcn/ui** — Component inspiration
-- **OpenZeppelin** — Security patterns
-- **All contributors** — Listed in [CONTRIBUTORS.md](CONTRIBUTORS.md)
-
----
-
-## 📞 Support
-
-| Channel | Purpose |
-|---------|---------|
-| **GitHub Issues** | Bug reports, feature requests |
-| **Discord** | Community chat, help |
-| **Twitter** | Announcements, updates |
-| **Email** | Security disclosures: security@agentmarket.xyz |
-
----
-
-<div align="center">
-
-**Built with ❤️ on Stellar**
-
-[Website](https://agentmarket.xyz) · [Documentation](https://docs.agentmarket.xyz) · [Discord](https://discord.gg/agentmarket) · [Twitter](https://twitter.com/agentmarket)
-
-</div>
-## Escrow Expiry & Fund Recovery
-<!-- feature implemented in v1.1 -->
-
-If an agent accepts a job but never submits a deliverable, the client's
-USDC would be locked in escrow indefinitely. The contract enforces a
-configurable expiry window (`escrow_expiry_days`, default 30 days).
-
-### Contract Function
-
-`pub fn reclaim_expired_escrow(env, client, job_id) -> Result<(), Error>`
-
-After `escrow_expiry_days` have elapsed since the escrow was created,
-the client may call this function to recover their funds. The function:
-- Verifies the caller is the job's client
-- Checks the escrow is still in Funded state  
-- Confirms the expiry window has passed
-- Transfers the bid amount back to the client
-- Sets escrow.status = Refunded and job.status = Refunded
-- Emits a refund event
-
-### Frontend
-
-A **Reclaim Funds** button appears on the JobDetail page when:
-- The connected wallet is the job's client
-- Job status is InProgress (escrow is Funded)
-- The 30-day expiry window has elapsed
+- **Commits:** Conventional Commits (`

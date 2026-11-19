@@ -48,12 +48,19 @@ case $NETWORK in
 esac
 
 # Resolve admin address: prefer explicit ADMIN_ADDRESS (e.g. multisig), else deployer key
+# NOTE: initialize() now requires admin.require_auth(). The invocation below is signed
+# by the admin's source account (ADMIN_SOURCE). Because initialize must be authorized by
+# the admin, deploy + initialize should be run atomically (e.g. via deploy-contract.sh
+# or a single script) to avoid a front-runner initializing with their own admin.
 if [ -n "$ADMIN_ADDRESS" ]; then
     ADMIN="$ADMIN_ADDRESS"
+    ADMIN_SOURCE=${ADMIN_SOURCE:-deployer}
     echo -e "${YELLOW}👤 Using admin from ADMIN_ADDRESS: $ADMIN${NC}"
+    echo -e "${YELLOW}🔑 Signing initialize() with source account: $ADMIN_SOURCE${NC}"
 else
-    ADMIN=$(stellar keys address deployer)
-    echo -e "${YELLOW}👤 Using deployer key as admin: $ADMIN${NC}"
+    ADMIN_SOURCE=${ADMIN_SOURCE:-deployer}
+    ADMIN=$(stellar keys address "$ADMIN_SOURCE")
+    echo -e "${YELLOW}👤 Using key '$ADMIN_SOURCE' as admin: $ADMIN${NC}"
 fi
 
 # Conservative caps: tighter on mainnet, looser on test networks
@@ -78,11 +85,48 @@ case $NETWORK in
         ;;
 esac
 
-# Initialize
+# Validate config values before invoking (mirrors contract validate_config rules)
+MIN_AGENT_REPUTATION=0
+MIN_AGENT_REPUTATION_TO_BID=0
+
+validate_positive() {
+    local name=$1 value=$2
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -le 0 ]; then
+        echo -e "${RED}❌ $name must be a positive integer (got: $value)${NC}"
+        exit 1
+    fi
+}
+
+validate_bps() {
+    local name=$1 value=$2
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -gt 10000 ]; then
+        echo -e "${RED}❌ $name must be an integer in 0..=10000 (got: $value)${NC}"
+        exit 1
+    fi
+}
+
+validate_reputation() {
+    local name=$1 value=$2
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -gt 100 ]; then
+        echo -e "${RED}❌ $name must be an integer in 0..=100 (got: $value)${NC}"
+        exit 1
+    fi
+}
+
+validate_bps "PLATFORM_FEE_BPS" "$PLATFORM_FEE_BPS"
+validate_bps "PLATFORM_FEE_BPS_DISPUTE" "$PLATFORM_FEE_BPS_DISPUTE"
+validate_positive "MIN_JOB_BUDGET" "$MIN_JOB_BUDGET"
+validate_positive "MAX_JOB_DEADLINE_DAYS" "$MAX_JOB_DEADLINE_DAYS"
+validate_positive "DISPUTE_WINDOW_DAYS" "$DISPUTE_WINDOW_DAYS"
+validate_positive "ESCROW_EXPIRY_DAYS" "$ESCROW_EXPIRY_DAYS"
+validate_reputation "MIN_AGENT_REPUTATION" "$MIN_AGENT_REPUTATION"
+validate_reputation "MIN_AGENT_REPUTATION_TO_BID" "$MIN_AGENT_REPUTATION_TO_BID"
+
+# Initialize (signed by the admin source account so admin.require_auth() passes)
 echo -e "${YELLOW}⚙️  Calling initialize()...${NC}"
 stellar contract invoke \
   --id "$CONTRACT_ID" \
-  --source-account deployer \
+  --source-account "$ADMIN_SOURCE" \
   --network "$NETWORK" \
   --rpc-url "$RPC_URL" \
   --network-passphrase "$NETWORK_PASSPHRASE" \
@@ -94,10 +138,10 @@ stellar contract invoke \
   --min_job_budget "$MIN_JOB_BUDGET" \
   --max_job_deadline_days "$MAX_JOB_DEADLINE_DAYS" \
   --dispute_window_days "$DISPUTE_WINDOW_DAYS" \
-  --min_agent_reputation 0 \
+  --min_agent_reputation "$MIN_AGENT_REPUTATION" \
   --platform_fee_recipient "$ADMIN" \
   --dispute_resolver "$ADMIN" \
-  --min_agent_reputation_to_bid 0 \
+  --min_agent_reputation_to_bid "$MIN_AGENT_REPUTATION_TO_BID" \
   --platform_fee_bps_dispute "$PLATFORM_FEE_BPS_DISPUTE" \
   --escrow_expiry_days "$ESCROW_EXPIRY_DAYS" \
   --skill_verifiers '[]' \
@@ -108,6 +152,7 @@ echo ""
 echo "Configuration (network: $NETWORK):"
 echo "  Contract ID: $CONTRACT_ID"
 echo "  Admin: $ADMIN"
+echo "  Admin Source: $ADMIN_SOURCE"
 echo "  USDC: $USDC_CONTRACT"
 echo "  Platform Fee: $PLATFORM_FEE_BPS bps"
 echo "  Min Job Budget: $MIN_JOB_BUDGET (stroops)"
