@@ -217,6 +217,12 @@ pub struct Config {
     pub min_agent_reputation_to_bid: u32,
     pub platform_fee_bps_dispute: u32, // Higher fee for disputes
     pub escrow_expiry_days: u64,
+    /// #115: Number of days after a dispute is raised before anyone may call
+    /// `claim_after_resolver_timeout` to apply the fallback resolution.
+    pub resolution_deadline_days: u64,
+    /// #115: Percentage of the (post-fee) payout sent to the agent when the
+    /// resolver times out.  The remainder is refunded to the client.
+    pub resolver_timeout_agent_pct: u32,
     pub skill_verifiers: Vec<Address>,
     /// When `true`, every required skill on a job must be verified on the
     /// bidding agent before the bid is accepted.  When `false`, unverified
@@ -278,6 +284,10 @@ pub enum DataKey {
     PlatformStats,
     IsPaused,
     Denylist,
+    /// #116: Admin-managed set of dispute resolvers.
+    Resolvers,
+    /// #116: Monotonic counter used to round-robin disputes across resolvers.
+    ResolverCounter,
 }
 
 #[contracttype]
@@ -392,6 +402,20 @@ pub const DISPUTE_FALLBACK_AGENT_PCT: u32 = 50;
 /// the storage cost per review.  Longer comments are rejected with
 /// `Error::InputTooLong`.
 pub const MAX_REVIEW_COMMENT_LEN: u32 = 500;
+/// #114: Maximum length, in bytes, of the free-form `reason` accepted by
+/// `raise_dispute`.  Longer reasons are rejected with
+/// `Error::DisputeTextTooLong`.
+pub const MAX_DISPUTE_REASON_LEN: u32 = 500;
+/// #114: Maximum length, in bytes, of the `evidence_uri` accepted by
+/// `raise_dispute`.  Longer URIs are rejected with
+/// `Error::DisputeTextTooLong`.
+pub const MAX_DISPUTE_EVIDENCE_URI_LEN: u32 = 256;
+/// #115: Default number of days after a dispute is raised before the fallback
+/// resolution may be triggered.
+pub const DEFAULT_RESOLUTION_DEADLINE_DAYS: u64 = 14;
+/// #115: Default percentage of the post-fee payout sent to the agent when the
+/// resolver times out (remainder refunded to the client).
+pub const DEFAULT_RESOLVER_TIMEOUT_AGENT_PCT: u32 = 50;
 
 #[contract]
 pub struct AiAgentMarketplace;
@@ -457,6 +481,8 @@ impl AiAgentMarketplace {
             min_agent_reputation_to_bid,
             platform_fee_bps_dispute,
             escrow_expiry_days,
+            resolution_deadline_days: DEFAULT_RESOLUTION_DEADLINE_DAYS,
+            resolver_timeout_agent_pct: DEFAULT_RESOLVER_TIMEOUT_AGENT_PCT,
             skill_verifiers,
             require_skill_verification,
             // #105: bumped from 1 to 2 when the unused `min_agent_reputation`
@@ -479,6 +505,12 @@ impl AiAgentMarketplace {
         env.storage().instance().set(&DataKey::DisputeCounter, &0u64);
         env.storage().instance().set(&DataKey::EscrowCounter, &0u64);
         env.storage().instance().set(&DataKey::VerificationCounter, &0u64);
+
+        // #116: seed the resolver set with the configured resolver.
+        let mut resolvers: Vec<Address> = Vec::new(&env);
+        resolvers.push_back(dispute_resolver.clone());
+        env.storage().instance().set(&DataKey::Resolvers, &resolvers);
+        env.storage().instance().set(&DataKey::ResolverCounter, &0u64);
 
         let stats = PlatformStats {
             total_agents: 0,
@@ -1456,7 +1488,11 @@ impl AiAgentMarketplace {
             return Err(Error::Unauthorized);
         }
 
-        if job.status == JobStatus::Disputed || job.status == JobStatus::Cancelled {
+        // #113: return the correct error per state.
+        if job.status == JobStatus::Cancelled {
+            return Err(Error::JobCancelled);
+        }
+        if job.status == JobStatus::Disputed {
             return Err(Error::AlreadyDisputed);
         }
 
@@ -1487,8 +1523,17 @@ impl AiAgentMarketplace {
         // Create dispute
         let dispute_id = Self::next_dispute_id(&env)?;
         let now = env.ledger().timestamp();
-        // #170: after this timestamp either party may trigger the fallback.
-        let dispute_deadline = now + (config.dispute_window_days * 86400);
+        // #115: after this timestamp anyone may trigger the fallback.
+        let dispute_deadline = now + (config.resolution_deadline_days * 86400);
+
+        // #116: assign a resolver round-robin from the admin-managed set.
+        let assigned_resolver = Self::assign_resolver(&env, &config)?;
+
+        // #114: hash the free-form text so the event payload stays constant.
+        let mut text = Bytes::new(&env);
+        text.append(&reason.clone().into());
+        text.append(&evidence_uri.clone().into());
+        let text_hash: BytesN<32> = env.crypto().sha256(&text).into();
 
         let dispute = Dispute {
             id: dispute_id,
@@ -1497,7 +1542,7 @@ impl AiAgentMarketplace {
             reason,
             evidence_uri,
             status: DisputeStatus::Open,
-            resolver: Some(config.dispute_resolver.clone()),
+            resolver: Some(assigned_resolver.clone()),
             resolution: None,
             created_at: now,
             resolved_at: None,
@@ -1521,6 +1566,7 @@ impl AiAgentMarketplace {
         escrow.status = EscrowStatus::Disputed;
         escrow.dispute_raised_at = Some(now);
         escrow.dispute_deadline = Some(dispute_deadline);
+        escrow.resolver = Some(assigned_resolver);
         env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
         Self::extend_instance_ttl(&env);
 
@@ -1534,9 +1580,10 @@ impl AiAgentMarketplace {
         client_stats.disputes = client_stats.disputes.saturating_add(1);
         env.storage().instance().set(&DataKey::ClientStats(job.client.clone()), &client_stats);
 
+        // #114: constant-size payload — only ids plus the text hash.
         env.events().publish(
             (symbol_short!("dispute"), job_id, raiser.clone()),
-            (dispute_id, job_id, raiser, dispute.reason.clone()),
+            (dispute_id, job_id, raiser, text_hash),
         );
 
         Ok(dispute_id)
@@ -1553,9 +1600,6 @@ impl AiAgentMarketplace {
         Self::extend_instance_ttl(&env);
 
         let config = Self::get_config(&env)?;
-        if resolver != config.dispute_resolver && resolver != config.admin {
-            return Err(Error::UnauthorizedResolver);
-        }
 
         let mut dispute = Self::get_dispute(&env, dispute_id)?;
 
@@ -1563,6 +1607,7 @@ impl AiAgentMarketplace {
             return Err(Error::DisputeResolved);
         }
 
+        // #116: only the assigned resolver (or the admin) may resolve.
         if dispute.resolver != Some(resolver.clone()) && resolver != config.admin {
             return Err(Error::UnauthorizedResolver);
         }
@@ -2049,6 +2094,157 @@ impl AiAgentMarketplace {
         Ok(())
     }
 
+    /// #115: Apply the fallback resolution once the resolver deadline has
+    /// elapsed without an admin/resolver decision.
+    ///
+    /// Permissionless: anyone may call this after `dispute.dispute_deadline`.
+    /// The post-fee payout is split per `config.resolver_timeout_agent_pct`
+    /// (agent) with the remainder refunded to the client, so the full escrow
+    /// amount is always accounted for.
+    pub fn claim_after_resolver_timeout(
+        env: Env,
+        caller: Address,
+        dispute_id: u64,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::ensure_not_paused(&env)?;
+        Self::extend_instance_ttl(&env);
+
+        let config = Self::get_config(&env)?;
+        let mut dispute = Self::get_dispute(&env, dispute_id)?;
+
+        if dispute.status != DisputeStatus::Open && dispute.status != DisputeStatus::UnderReview {
+            return Err(Error::DisputeResolved);
+        }
+
+        // Deadline must have elapsed.
+        if env.ledger().timestamp() <= dispute.dispute_deadline {
+            return Err(Error::ResolutionDeadlineNotReached);
+        }
+
+        let mut job = Self::get_job(&env, dispute.job_id)?;
+
+        let escrow_id: u64 = env.storage().instance()
+            .get(&DataKey::EscrowByJob(dispute.job_id))
+            .ok_or(Error::EscrowNotFound)?;
+        let mut escrow = Self::get_escrow(&env, escrow_id)?;
+
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::EscrowNotDisputed);
+        }
+
+        let dispute_fee = (escrow.amount * config.platform_fee_bps_dispute as i128) / 10000;
+        let payout = escrow.amount - dispute_fee;
+
+        let pct = config.resolver_timeout_agent_pct.min(100);
+        let agent_amount = (payout * pct as i128) / 100;
+        let client_amount = payout - agent_amount;
+
+        // ===== CHECKS-EFFECTS-INTERACTIONS =====
+        // All validation above; all state writes below; token transfers last.
+
+        // ----- Effects: write all state before any external call -----
+        escrow.status = EscrowStatus::Released;
+        escrow.released_at = Some(env.ledger().timestamp());
+        env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
+
+        // Release the locked-escrow accounting now that funds have left.
+        let mut updated_config = config.clone();
+        updated_config.total_locked_escrow =
+            (updated_config.total_locked_escrow - escrow.amount).max(0);
+        env.storage().instance().set(&DataKey::Config, &updated_config);
+
+        dispute.status = DisputeStatus::Resolved;
+        dispute.resolution = Some(String::from_str(&env, "resolver_timeout"));
+        dispute.resolved_at = Some(env.ledger().timestamp());
+        env.storage().instance().set(&DataKey::Dispute(dispute_id), &dispute);
+
+        job.status = JobStatus::Completed;
+        env.storage().instance().set(&DataKey::Job(dispute.job_id), &job);
+        Self::extend_instance_ttl(&env);
+
+        // ----- Interactions: token transfers last -----
+        let usdc_client = TokenClient::new(&env, &config.usdc_token);
+        if dispute_fee > 0 {
+            usdc_client.transfer(
+                &env.current_contract_address(),
+                &config.platform_fee_recipient,
+                &dispute_fee,
+            );
+        }
+        Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.agent, agent_amount);
+        Self::payout_or_claim(&env, &config, dispute.job_id, &escrow.client, client_amount);
+
+        env.events().publish(
+            (symbol_short!("disp_to"), dispute.job_id, caller.clone()),
+            (dispute_id, caller, agent_amount, client_amount),
+        );
+
+        Ok(())
+    }
+
+    /// #116: Admin — add a dispute resolver to the managed set.
+    pub fn add_resolver(env: Env, admin: Address, resolver: Address) -> Result<(), Error> {
+        admin.require_auth();
+        Self::extend_instance_ttl(&env);
+
+        let config = Self::get_config(&env)?;
+        if config.admin != admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut resolvers: Vec<Address> = env.storage().instance()
+            .get(&DataKey::Resolvers)
+            .unwrap_or(Vec::new(&env));
+        if !resolvers.contains(&resolver) {
+            resolvers.push_back(resolver.clone());
+            env.storage().instance().set(&DataKey::Resolvers, &resolvers);
+        }
+
+        env.events().publish(
+            (symbol_short!("res_add"), admin),
+            resolver,
+        );
+
+        Ok(())
+    }
+
+    /// #116: Admin — remove a dispute resolver from the managed set.
+    pub fn remove_resolver(env: Env, admin: Address, resolver: Address) -> Result<(), Error> {
+        admin.require_auth();
+        Self::extend_instance_ttl(&env);
+
+        let config = Self::get_config(&env)?;
+        if config.admin != admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let resolvers: Vec<Address> = env.storage().instance()
+            .get(&DataKey::Resolvers)
+            .unwrap_or(Vec::new(&env));
+        let mut updated: Vec<Address> = Vec::new(&env);
+        for r in resolvers.iter() {
+            if r != resolver {
+                updated.push_back(r);
+            }
+        }
+        env.storage().instance().set(&DataKey::Resolvers, &updated);
+
+        env.events().publish(
+            (symbol_short!("res_rem"), admin),
+            resolver,
+        );
+
+        Ok(())
+    }
+
+    /// #116: Get the current dispute resolver set.
+    pub fn get_resolvers(env: Env) -> Vec<Address> {
+        env.storage().instance()
+            .get(&DataKey::Resolvers)
+            .unwrap_or(Vec::new(&env))
+    }
+
     /// #172: Keeper entrypoint — bump the TTL of a job and its escrow.
     ///
     /// Anyone may call this to keep long-running escrows alive on mainnet.
@@ -2397,6 +2593,8 @@ impl AiAgentMarketplace {
         escrow_expiry_days: Option<u64>,
         skill_verifiers: Option<Vec<Address>>,
         require_skill_verification: Option<bool>,
+        resolution_deadline_days: Option<u64>,
+        resolver_timeout_agent_pct: Option<u32>,
     ) -> Result<(), Error> {
         admin.require_auth();
         Self::extend_instance_ttl(&env);
@@ -2488,6 +2686,27 @@ impl AiAgentMarketplace {
                 );
             }
             config.escrow_expiry_days = days;
+        }
+        if let Some(days) = resolution_deadline_days {
+            if days != config.resolution_deadline_days {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("res_days")),
+                    (config.resolution_deadline_days, days),
+                );
+            }
+            config.resolution_deadline_days = days;
+        }
+        if let Some(pct) = resolver_timeout_agent_pct {
+            if pct > 100 {
+                return Err(Error::InvalidConfig);
+            }
+            if pct != config.resolver_timeout_agent_pct {
+                env.events().publish(
+                    (symbol_short!("config_upd"), symbol_short!("res_pct")),
+                    (config.resolver_timeout_agent_pct, pct),
+                );
+            }
+            config.resolver_timeout_agent_pct = pct;
         }
         if let Some(verifiers) = skill_verifiers {
             if verifiers != config.skill_verifiers {
@@ -2682,6 +2901,23 @@ impl AiAgentMarketplace {
         env.storage().instance()
             .get(&DataKey::Config)
             .ok_or(Error::NotInitialized)
+    }
+
+    /// #116: Pick the next resolver round-robin from the managed set, falling
+    /// back to `config.dispute_resolver` when the set is empty.
+    fn assign_resolver(env: &Env, config: &Config) -> Result<Address, Error> {
+        let resolvers: Vec<Address> = env.storage().instance()
+            .get(&DataKey::Resolvers)
+            .unwrap_or(Vec::new(env));
+        if resolvers.is_empty() {
+            return Ok(config.dispute_resolver.clone());
+        }
+        let counter: u64 = env.storage().instance()
+            .get(&DataKey::ResolverCounter)
+            .unwrap_or(0);
+        let idx = (counter % resolvers.len() as u64) as u32;
+        env.storage().instance().set(&DataKey::ResolverCounter, &(counter + 1));
+        resolvers.get(idx).ok_or(Error::ResolverNotFound)
     }
 
     fn ensure_not_paused(env: &Env) -> Result<(), Error> {
