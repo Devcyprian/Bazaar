@@ -8,7 +8,6 @@
 #
 # Environment (see scripts/ops-common.sh for the shared ones):
 #   REPORT_DIR   Directory for reports (default: reports)
-#   PAGE_SIZE    Jobs fetched per get_all_jobs call (default: 50)
 #
 # Exit codes: 0 = balanced, 1 = error, 2 = drift detected.
 # Response runbook: docs/ops/escrow-reconciliation.md
@@ -20,7 +19,6 @@ source "$SCRIPT_DIR/ops-common.sh"
 ops_init "$1"
 
 REPORT_DIR=${REPORT_DIR:-reports}
-PAGE_SIZE=${PAGE_SIZE:-50}
 DATE=$(date -u +%Y-%m-%d)
 REPORT_FILE="$REPORT_DIR/escrow-reconciliation-$NETWORK-$DATE.md"
 mkdir -p "$REPORT_DIR"
@@ -31,36 +29,7 @@ CONFIG=$(ops_view "$CONTRACT_ID" get_config)
 USDC_TOKEN=$(echo "$CONFIG" | jq -r '.usdc_token')
 TOTAL_LOCKED=$(ops_int "$(echo "$CONFIG" | jq -r '.total_locked_escrow')")
 
-# Walk every job and sum the escrows that still hold funds.
-OPEN_SUM=0
-OPEN_COUNT=0
-FUNDED_SUM=0
-DISPUTED_SUM=0
-ESCROW_ROWS=""
-OFFSET=0
-while true; do
-    PAGE=$(ops_view "$CONTRACT_ID" get_all_jobs --offset "$OFFSET" --limit "$PAGE_SIZE")
-    PAGE_LEN=$(echo "$PAGE" | jq 'length')
-    [ "$PAGE_LEN" -eq 0 ] && break
-
-    for JOB_ID in $(echo "$PAGE" | jq -r '.[] | select((.escrow_amount | tostring) != "0") | .id'); do
-        ESCROW=$(ops_view "$CONTRACT_ID" get_escrow_by_job --job_id "$JOB_ID")
-        [ "$ESCROW" = "null" ] && continue
-
-        STATUS=$(echo "$ESCROW" | jq -r '.status')
-        AMOUNT=$(ops_int "$(echo "$ESCROW" | jq -r '.amount')")
-        case $STATUS in
-            Funded) FUNDED_SUM=$(( FUNDED_SUM + AMOUNT )) ;;
-            Disputed) DISPUTED_SUM=$(( DISPUTED_SUM + AMOUNT )) ;;
-            *) continue ;;
-        esac
-        OPEN_SUM=$(( OPEN_SUM + AMOUNT ))
-        OPEN_COUNT=$(( OPEN_COUNT + 1 ))
-        ESCROW_ROWS="$ESCROW_ROWS| $JOB_ID | $STATUS | $(ops_usdc "$AMOUNT") |"$'\n'
-    done
-
-    OFFSET=$(( OFFSET + PAGE_SIZE ))
-done
+ops_scan_escrows
 
 BALANCE=$(ops_int "$(ops_view "$USDC_TOKEN" balance --id "$CONTRACT_ID")")
 BALANCE_DRIFT=$(( BALANCE - OPEN_SUM ))

@@ -1,0 +1,51 @@
+name: Contract Monitoring
+
+on:
+  schedule:
+    # Hourly; matches the default 720-ledger event window
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      network:
+        description: 'Network to monitor'
+        required: true
+        default: 'testnet'
+        type: choice
+        options:
+          - testnet
+          - mainnet
+          - futurenet
+
+jobs:
+  monitor:
+    name: Monitor contract (${{ inputs.network || vars.MONITOR_NETWORK || 'testnet' }})
+    runs-on: ubuntu-latest
+    env:
+      NETWORK: ${{ inputs.network || vars.MONITOR_NETWORK || 'testnet' }}
+      CONTRACT_ID: ${{ secrets.MARKETPLACE_CONTRACT_ID }}
+      SOURCE_ACCOUNT: ${{ secrets.RECONCILE_SECRET_KEY }}
+      ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+      DISPUTE_SPIKE_THRESHOLD: ${{ vars.DISPUTE_SPIKE_THRESHOLD || '5' }}
+      LARGE_ESCROW_STROOPS: ${{ vars.LARGE_ESCROW_STROOPS || '10000000000' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Stellar CLI
+        run: |
+          curl -sSL https://github.com/stellar/stellar-cli/raw/main/install.sh | bash -s -- --version 21.0.0
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Index events, check escrow and raise alerts
+        run: ./scripts/monitor-contract.sh "$NETWORK"
+
+      - name: Publish dashboard to job summary
+        if: always()
+        run: cat reports/escrow-dashboard-*.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload dashboard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: escrow-dashboard-${{ env.NETWORK }}-${{ github.run_id }}
+          path: reports/
+          retention-days: 30
