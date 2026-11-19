@@ -167,19 +167,26 @@ export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({ child
     const signedXdr = await signTransaction(prepared.toXDR());
     const signedTx = TransactionBuilder.fromXDR(signedXdr, config.networkPassphrase) as Transaction;
 
-    const sendResult = await rpc.sendTransaction(signedTx);
-    if (sendResult.status === 'ERROR') {
-      throw new Error('Failed to submit transaction to the network.');
+    // #186: when a fee sponsor is configured, the platform pays the network
+    // fee via a fee-bump transaction. Fall back to a user-paid submission if
+    // the sponsor declines (disabled, rate limited, budget exhausted).
+    let hash = await submitSponsored(signedXdr);
+    if (!hash) {
+      const sendResult = await rpc.sendTransaction(signedTx);
+      if (sendResult.status === 'ERROR') {
+        throw new Error('Failed to submit transaction to the network.');
+      }
+      hash = sendResult.hash;
     }
 
-    let txResult = await rpc.getTransaction(sendResult.hash);
+    let txResult = await rpc.getTransaction(hash);
     const deadline = Date.now() + 30000;
     while (txResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND) {
       if (Date.now() > deadline) {
         throw new Error('Timed out waiting for transaction confirmation.');
       }
       await new Promise((resolve) => setTimeout(resolve, 1500));
-      txResult = await rpc.getTransaction(sendResult.hash);
+      txResult = await rpc.getTransaction(hash);
     }
 
     if (txResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
@@ -255,6 +262,32 @@ export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({ child
       {children}
     </StellarContext.Provider>
   );
+};
+
+/**
+ * #186: Submit a signed transaction through the fee sponsor (see
+ * api/fee-bump.ts). Returns the fee-bump transaction hash, or null when no
+ * sponsor is configured or it declined the transaction.
+ */
+const submitSponsored = async (signedXdr: string): Promise<string | null> => {
+  const sponsorUrl = import.meta.env.VITE_FEE_SPONSOR_URL;
+  if (!sponsorUrl) return null;
+  try {
+    const response = await fetch(sponsorUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ xdr: signedXdr }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || typeof body.hash !== 'string') {
+      console.warn('Fee sponsor declined transaction:', body.error ?? response.status);
+      return null;
+    }
+    return body.hash;
+  } catch (error) {
+    console.warn('Fee sponsor unavailable:', error);
+    return null;
+  }
 };
 
 // Type conversion helpers
