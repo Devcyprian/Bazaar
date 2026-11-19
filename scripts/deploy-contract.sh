@@ -10,12 +10,19 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 # Configuration
+MODE="deploy"
+if [ "$1" = "upgrade" ] || [ "$1" = "--upgrade" ]; then
+    MODE="upgrade"
+    shift
+fi
 NETWORK=${1:-testnet}
 SOURCE_ACCOUNT=${2:-deployer}
 CONTRACT_ALIAS="ai-agent-marketplace"
 WASM_PATH="contracts/ai-agent-marketplace/target/wasm32-unknown-unknown/release/ai_agent_marketplace.wasm"
+# Source account used for upgrades (multisig admin)
+ADMIN_SOURCE=${ADMIN_SOURCE:-admin-multisig}
 
-echo -e "${GREEN}🚀 AI Agent Marketplace Contract Deployment${NC}"
+echo -e "${GREEN}🚀 AI Agent Marketplace Contract ${MODE^}${NC}"
 echo "Network: $NETWORK"
 echo "Source account: $SOURCE_ACCOUNT"
 echo ""

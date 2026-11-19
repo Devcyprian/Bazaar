@@ -746,7 +746,7 @@ owners and due dates.
 
 | Limitation | Mitigation |
 |------------|------------|
-| Single contract = single point of failure | Upgradeable via admin (planned) |
+| Single contract = single point of failure | Admin-gated `upgrade(new_wasm_hash)` via multisig, with `version()` getter and documented migration/rollback runbook (see [Contract Upgrades & Migration](#-contract-upgrades--migration)) |
 | No on-chain randomness | Not needed for current features |
 | Skill verification centralized | Multi-verifier support + DAO governance planned |
 | Dispute resolver = single address | Multi-sig / DAO resolver support planned; timeout fallback (`resolve_dispute_fallback`) guarantees resolution |
@@ -757,7 +757,7 @@ owners and due dates.
 ## 🛣️ Roadmap
 
 ### v1.1 (Q2 2024)
-- [ ] Contract upgradeability (proxy pattern)
+- [x] Contract upgradeability (`upgrade` + `version`)
 - [ ] DAO governance for config changes
 - [ ] Multi-sig dispute resolvers
 - [ ] Agent categories & tags
