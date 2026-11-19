@@ -9,15 +9,16 @@ import { Textarea } from '@/components/ui/Textarea';
 import {
   DollarSign, Clock, User, CheckCircle, AlertCircle,
   ArrowLeft, Send, Wallet, Loader2, ExternalLink,
-  Shield, FileText, XCircle, RefreshCw, Upload,
+  Shield, FileText, XCircle, RefreshCw,
 } from 'lucide-react';
 import { useWallet } from '@/contexts/WalletContext';
 import { useStellar } from '@/contexts/StellarContext';
-import type { Bid, Job } from '@/lib/types';
+import type { Bid, Job, Review } from '@/lib/types';
 import { QueryError } from '@/components/ui/QueryError';
 import { formatPrice, getSkillColor } from '@/pages/Marketplace';
 import { clsx } from 'clsx';
-import { format, formatDistanceToNow } from 'date-fns';
+import { format } from 'date-fns/format';
+import { formatDistanceToNow } from 'date-fns/formatDistanceToNow';
 import {
   uploadToIpfs,
   sha256OfFile,
@@ -55,6 +56,11 @@ export const JobDetail: React.FC = () => {
   const [showDeliverableModal, setShowDeliverableModal] = useState(false);
   const [deliverableNote, setDeliverableNote] = useState('');
   const [isActing, setIsActing] = useState(false);
+
+  // Review form state
+  const [reviewRating, setReviewRating] = useState(0);
+  const [reviewComment, setReviewComment] = useState('');
+  const [isSubmittingReview, setIsSubmittingReview] = useState(false);
 
   // IPFS deliverable upload state
   const [deliverableFile, setDeliverableFile] = useState<File | null>(null);
@@ -123,6 +129,17 @@ export const JobDetail: React.FC = () => {
 
   const bids: Bid[] = bidsPages?.pages.flat() ?? [];
 
+  // ── reviews query ──────────────────────────────────────────────────────────
+  const { data: reviews = [], refetch: refetchReviews } = useQuery<Review[]>({
+    queryKey: ['job-reviews', jobIdNum],
+    queryFn: async () => {
+      const client = getContractClient();
+      if (!client) return [];
+      return client.getReviewsByJob(jobIdNum);
+    },
+    enabled: !!jobIdNum,
+  });
+
   // ── infinite-scroll sentinel for the bids list ─────────────────────────────
   useEffect(() => {
     const sentinel = loadMoreBidsRef.current;
@@ -148,6 +165,13 @@ export const JobDetail: React.FC = () => {
   // ── derived state ──────────────────────────────────────────────────────────
   const isClient = publicKey === job?.client;
   const isAssignedAgent = publicKey === job?.assignedAgent;
+  const isParticipant = isClient || isAssignedAgent;
+  const hasReviewed = !!publicKey && reviews.some((r) => r.reviewer === publicKey);
+  const canReview =
+    isConnected &&
+    isParticipant &&
+    job?.status === 'Completed' &&
+    !hasReviewed;
   const canBid =
     isConnected &&
     !isClient &&
@@ -326,6 +350,39 @@ export const JobDetail: React.FC = () => {
       alert(err instanceof Error ? err.message : 'Failed to approve deliverable.');
     } finally {
       setIsActing(false);
+    }
+  };
+
+  const handleSubmitReview = async () => {
+    if (!publicKey || !isParticipant) return;
+    if (reviewRating < 1 || reviewRating > 5) {
+      alert('Please select a rating between 1 and 5 stars.');
+      return;
+    }
+    const client = getContractClient();
+    if (!client) {
+      alert('Not connected to the marketplace contract. Configure it in Settings.');
+      return;
+    }
+    setIsSubmittingReview(true);
+    try {
+      await client.leaveReview(publicKey, signTransaction, {
+        jobId: jobIdNum,
+        rating: reviewRating,
+        comment: reviewComment.trim(),
+      });
+      setReviewRating(0);
+      setReviewComment('');
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['job-reviews', jobIdNum] }),
+        queryClient.invalidateQueries({ queryKey: ['job', jobIdNum] }),
+      ]);
+      alert('Review submitted. Thank you!');
+    } catch (err) {
+      console.error('Review failed:', err);
+      alert(err instanceof Error ? err.message : 'Failed to submit review. Please try again.');
+    } finally {
+      setIsSubmittingReview(false);
     }
   };
 
@@ -592,6 +649,71 @@ export const JobDetail: React.FC = () => {
           )}
         </div>
 
+        {/* ── Review form (participants only, once, after completion) ── */}
+        {canReview && (
+          <Card className="mb-8 border-primary/20">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <CheckCircle className="h-5 w-5 text-primary" />
+                Leave a Review
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div>
+                <p className="text-sm font-medium mb-2">Rating</p>
+                <div className="flex items-center gap-1" role="radiogroup" aria-label="Rating">
+                  {[1, 2, 3, 4, 5].map((star) => (
+                    <button
+                      key={star}
+                      type="button"
+                      role="radio"
+                      aria-checked={reviewRating === star}
+                      aria-label={`${star} star${star > 1 ? 's' : ''}`}
+                      onClick={() => setReviewRating(star)}
+                      disabled={isSubmittingReview}
+                      className={clsx(
+                        'text-2xl leading-none transition-colors',
+                        star <= reviewRating
+                          ? 'text-yellow-500'
+                          : 'text-muted-foreground hover:text-yellow-400',
+                      )}
+                    >
+                      ★
+                    </button>
+                  ))}
+                  <span className="ml-2 text-sm text-muted-foreground">
+                    {reviewRating > 0 ? `${reviewRating}/5` : 'Select a rating'}
+                  </span>
+                </div>
+              </div>
+              <div>
+                <label htmlFor="review-comment" className="text-sm font-medium mb-2 block">
+                  Comment (optional)
+                </label>
+                <Textarea
+                  id="review-comment"
+                  value={reviewComment}
+                  onChange={(e) => setReviewComment(e.target.value)}
+                  placeholder="Share your experience working with this counterparty…"
+                  rows={3}
+                  disabled={isSubmittingReview}
+                />
+              </div>
+              <Button
+                onClick={handleSubmitReview}
+                disabled={isSubmittingReview || reviewRating < 1}
+              >
+                {isSubmittingReview ? (
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                ) : (
+                  <Send className="h-4 w-4 mr-2" />
+                )}
+                Submit Review
+              </Button>
+            </CardContent>
+          </Card>
+        )}
+
         {/* ── Tabs ── */}
         <div className="space-y-6">
           <div className="border-b">
@@ -770,6 +892,40 @@ export const JobDetail: React.FC = () => {
                           </a>
                         </div>
                       )}
+                    </CardContent>
+                  </Card>
+                )}
+
+                {/* Reviews */}
+                {reviews.length > 0 && (
+                  <Card>
+                    <CardHeader>
+                      <CardTitle className="flex items-center gap-2">
+                        <CheckCircle className="h-5 w-5" />
+                        Reviews
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent className="space-y-4">
+                      {reviews.map((review) => (
+                        <div key={review.id} className="border-b last:border-b-0 pb-3 last:pb-0">
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-sm font-medium">
+                              {review.reviewer.slice(0, 8)}…
+                            </span>
+                            <span className="text-yellow-500 text-sm" aria-label={`${review.rating} out of 5 stars`}>
+                              {'★'.repeat(review.rating)}
+                              <span className="text-muted-foreground">
+                                {'★'.repeat(5 - review.rating)}
+                              </span>
+                            </span>
+                          </div>
+                          {review.comment && (
+                            <p className="text-sm text-muted-foreground whitespace-pre-wrap">
+                              {review.comment}
+                            </p>
+                          )}
+                        </div>
+                      ))}
                     </CardContent>
                   </Card>
                 )}

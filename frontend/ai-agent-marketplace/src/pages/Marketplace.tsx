@@ -5,12 +5,13 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
-import { Search, Filter, Star, DollarSign, Clock, Users, TrendingUp, ArrowRight, CheckCircle, AlertCircle } from 'lucide-react';
+import { Search, Filter, Star, DollarSign, Clock, Users, TrendingUp, CheckCircle } from 'lucide-react';
 import { useWallet } from '@/contexts/WalletContext';
 import { useStellar } from '@/contexts/StellarContext';
 import type { Agent, Job, PlatformStats } from '@/lib/types';
 import { QueryError } from '@/components/ui/QueryError';
-import { format, formatDistanceToNow } from 'date-fns';
+import { format } from 'date-fns/format';
+import { formatDistanceToNow } from 'date-fns/formatDistanceToNow';
 import { clsx } from 'clsx';
 
 const ALL_SKILLS = [

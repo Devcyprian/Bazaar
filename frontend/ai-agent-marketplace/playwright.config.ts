@@ -17,6 +17,9 @@ import { defineConfig, devices } from '@playwright/test';
  *   wallet-gate.spec.ts    - unauthenticated route guards
  *   agent-profile.spec.ts  - /agent/:id profile rendering
  *   navigation.spec.ts     - smoke tests for all top-level routes
+ *
+ * Shared mocks (mocked Freighter wallet + mocked RPC/Soroban responses) live
+ * in ./e2e/fixtures and are imported by the specs.
  */
 export default defineConfig({
   testDir: './e2e',
@@ -24,7 +27,9 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
   workers: process.env.CI ? 1 : undefined,
-  reporter: process.env.CI ? 'github' : 'list',
+  reporter: process.env.CI
+    ? [['github'], ['html', { open: 'never' }]]
+    : [['list'], ['html', { open: 'never' }]],
   use: {
     baseURL: 'http://localhost:5173',
     trace: 'on-first-retry',

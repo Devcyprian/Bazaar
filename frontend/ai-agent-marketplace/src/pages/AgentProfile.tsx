@@ -7,11 +7,13 @@ import { Button } from '@/components/ui/Button';
 import { Star, DollarSign, Clock, CheckCircle, Award, Shield, ExternalLink, MessageSquare, ArrowLeft, Wallet, Send, AlertCircle, Loader2 } from 'lucide-react';
 import { useWallet } from '@/contexts/WalletContext';
 import { useStellar } from '@/contexts/StellarContext';
-import type { Agent, Bid, Job, Review } from '@/lib/types';
+import type { Agent, Job, Review } from '@/lib/types';
 import { QueryError } from '@/components/ui/QueryError';
 import { formatPrice, getSkillColor } from '@/pages/Marketplace';
 import { clsx } from 'clsx';
-import { format, formatDistanceToNow } from 'date-fns';
+import format from 'date-fns/format';
+import formatDistanceToNow from 'date-fns/formatDistanceToNow';
+import { useAgentMetadata } from '@/hooks/useAgentMetadata';
 
 /** Number of items fetched per page from the contract. */
 const PAGE_SIZE = 20;
@@ -98,6 +100,10 @@ export const AgentProfile: React.FC = () => {
   // Flatten paginated results
   const jobs: Job[] = jobsPages?.pages.flat() ?? [];
   const reviews: Review[] = reviewsPages?.pages.flat() ?? [];
+
+  // Fetch and validate off-chain metadata (avatar, links, portfolio) before
+  // rendering it. Invalid or unreachable metadata yields `null` and a fallback.
+  const { data: metadata, isLoading: isMetadataLoading } = useAgentMetadata(agent?.metadataUri);
 
   // Sentinel refs for infinite scroll
   const jobsSentinelRef = useRef<HTMLDivElement>(null);
@@ -300,9 +306,17 @@ export const AgentProfile: React.FC = () => {
             <Card>
               <CardContent className="p-6">
                 <div className="text-center space-y-4">
-                  <div className="w-24 h-24 rounded-full bg-gradient-to-br from-primary to-stellar mx-auto flex items-center justify-center text-3xl">
-                    🤖
-                  </div>
+                  {metadata?.avatar ? (
+                    <img
+                      src={metadata.avatar}
+                      alt={`${agent.name} avatar`}
+                      className="w-24 h-24 rounded-full mx-auto object-cover"
+                    />
+                  ) : (
+                    <div className="w-24 h-24 rounded-full bg-gradient-to-br from-primary to-stellar mx-auto flex items-center justify-center text-3xl">
+                      🤖
+                    </div>
+                  )}
                   <div>
                     <h3 className="font-semibold text-lg">{agent.name}</h3>
                     <p className="text-sm text-muted-foreground">ID: #{agent.id}</p>
@@ -337,6 +351,61 @@ export const AgentProfile: React.FC = () => {
                       <ExternalLink className="h-4 w-4" />
                       View Metadata on IPFS
                     </a>
+                  )}
+
+                  {isMetadataLoading && (
+                    <p className="text-xs text-muted-foreground">Loading metadata…</p>
+                  )}
+
+                  {!isMetadataLoading && agent.metadataUri && !metadata && (
+                    <p className="text-xs text-muted-foreground">
+                      Metadata unavailable or failed validation.
+                    </p>
+                  )}
+
+                  {metadata && (metadata.links.length > 0 || metadata.portfolio.length > 0) && (
+                    <div className="space-y-2 pt-4 border-t text-left">
+                      {metadata.links.length > 0 && (
+                        <div>
+                          <p className="text-xs font-medium text-muted-foreground mb-1">Links</p>
+                          <ul className="space-y-1">
+                            {metadata.links.map(link => (
+                              <li key={link.url}>
+                                <a
+                                  href={link.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="flex items-center gap-1 text-sm text-primary hover:underline"
+                                >
+                                  <ExternalLink className="h-3 w-3" />
+                                  {link.label}
+                                </a>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {metadata.portfolio.length > 0 && (
+                        <div>
+                          <p className="text-xs font-medium text-muted-foreground mb-1">Portfolio</p>
+                          <ul className="space-y-1">
+                            {metadata.portfolio.map(item => (
+                              <li key={item.url}>
+                                <a
+                                  href={item.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="flex items-center gap-1 text-sm text-primary hover:underline"
+                                >
+                                  <ExternalLink className="h-3 w-3" />
+                                  {item.title}
+                                </a>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
                   )}
                 </div>
               </CardContent>
@@ -518,11 +587,11 @@ export const AgentProfile: React.FC = () => {
                       <CardContent className="p-4">
                         <div className="flex items-start gap-4">
                           <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center text-primary font-medium">
-                            {review.reviewer?.charAt(0) || 'C'}
+                            {review.reviewer.charAt(0) || 'C'}
                           </div>
                           <div className="flex-1">
                             <div className="flex items-center gap-2 mb-1">
-                              <span className="font-medium">{review.reviewer?.slice(0, 8)}...</span>
+                              <span className="font-medium">{review.reviewer.slice(0, 8)}...</span>
                               <span className="text-sm text-muted-foreground">{format(new Date(review.createdAt * 1000), 'MMM d, yyyy')}</span>
                             </div>
                             <div className="flex items-center gap-1 mb-2">

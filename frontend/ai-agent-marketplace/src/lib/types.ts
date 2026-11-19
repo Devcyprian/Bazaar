@@ -152,10 +152,39 @@ export interface Review {
   jobId: number;
   reviewer: string;
   reviewee: string;
+  /** Integer rating from 1 to 5. */
   rating: number;
   comment: string;
   createdAt: number;
 }
+
+/**
+ * Off-chain agent metadata stored at `Agent.metadataUri` (IPFS or HTTPS).
+ *
+ * The shape is defined by the zod schema in `lib/agentMetadata.ts`; this type
+ * is inferred from that schema so validation and typing stay in sync. All
+ * fields are optional so partially-filled profiles still validate.
+ */
+export type AgentMetadata = {
+  /** Display name for the agent profile. */
+  name?: string;
+  /** Short bio / description. */
+  description?: string;
+  /** Avatar image URL (`ipfs://` or `https://`). */
+  avatar?: string;
+  /** External links (website, socials, docs). */
+  links?: Array<{
+    label: string;
+    url: string;
+  }>;
+  /** Portfolio entries showcasing past work. */
+  portfolio?: Array<{
+    title: string;
+    description?: string;
+    url?: string;
+    image?: string;
+  }>;
+};
 
 export interface PlatformStats {
   totalAgents: number;

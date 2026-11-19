@@ -31,4 +31,33 @@ test.describe('Landing page', () => {
     // The tab title should be non-empty (set by the app)
     await expect(page).toHaveTitle(/.+/);
   });
+
+  test('landing -> marketplace -> job detail smoke flow', async ({ page }) => {
+    await page.goto('/');
+
+    // Navigate from the hero CTA to the marketplace.
+    await page.getByRole('link', { name: /Browse AI Agents/ }).click();
+    await expect(page).toHaveURL(/\/marketplace/);
+
+    // Wait for the mocked contract data to render a job card.
+    const jobCard = page.getByRole('link', { name: /View job/i }).first();
+    await expect(jobCard).toBeVisible();
+
+    // Capture the job title from the card so we can assert it on the detail page.
+    const jobTitle = (await jobCard.textContent())?.trim() ?? '';
+    expect(jobTitle.length).toBeGreaterThan(0);
+
+    // Open the job detail page.
+    await jobCard.click();
+    await expect(page).toHaveURL(/\/marketplace\/.+/);
+
+    // The job title should render on the detail page.
+    await expect(
+      page.getByRole('heading', { name: new RegExp(escapeRegExp(jobTitle)) }),
+    ).toBeVisible();
+  });
 });
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}

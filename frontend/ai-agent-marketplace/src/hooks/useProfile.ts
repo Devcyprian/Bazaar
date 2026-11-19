@@ -16,7 +16,8 @@
  */
 
 import { useState, useEffect, useCallback } from 'react';
-import { useInfiniteQuery } from '@tanstack/react-query';
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
+import { AgentMetadataSchema, type AgentMetadata } from '@/lib/agentMetadata';
 
 export interface UserProfile {
   displayName: string;
@@ -62,6 +63,58 @@ export function usePaginatedContractQuery<T>(
     getNextPageParam,
     enabled: options?.enabled ?? true,
   });
+}
+
+/**
+ * Default IPFS gateway used to resolve `ipfs://<cid>` metadata URIs.
+ * Override with `VITE_IPFS_GATEWAY` (e.g. a dedicated pinning gateway).
+ */
+const DEFAULT_IPFS_GATEWAY = 'https://ipfs.io/ipfs/';
+
+function resolveMetadataUrl(uri: string): string | null {
+  const trimmed = uri.trim();
+  if (trimmed.startsWith('ipfs://')) {
+    const gateway =
+      (import.meta.env?.VITE_IPFS_GATEWAY as string | undefined) ?? DEFAULT_IPFS_GATEWAY;
+    const base = gateway.endsWith('/') ? gateway : `${gateway}/`;
+    return `${base}${trimmed.slice('ipfs://'.length).replace(/^\/+/, '')}`;
+  }
+  if (trimmed.startsWith('https://')) return trimmed;
+  return null;
+}
+
+/**
+ * Fetches an agent's `metadata_uri`, resolves it (IPFS gateway or https),
+ * and validates the JSON with `AgentMetadataSchema` before returning it.
+ *
+ * Returns `null` for missing/invalid URIs, failed fetches, or JSON that does
+ * not satisfy the schema, so callers can render a graceful fallback instead
+ * of unvalidated data.
+ */
+export function useAgentMetadata(metadataUri: string | null | undefined) {
+  const url = metadataUri ? resolveMetadataUrl(metadataUri) : null;
+
+  const query = useQuery<AgentMetadata | null>({
+    queryKey: ['agent-metadata', url],
+    enabled: Boolean(url),
+    queryFn: async () => {
+      if (!url) return null;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Metadata fetch failed (${res.status})`);
+      const json: unknown = await res.json();
+      const parsed = AgentMetadataSchema.safeParse(json);
+      return parsed.success ? parsed.data : null;
+    },
+    // Metadata is immutable per URI; avoid refetching on every mount.
+    staleTime: 5 * 60 * 1000,
+    retry: 1,
+  });
+
+  return {
+    metadata: query.data ?? null,
+    isLoading: query.isLoading,
+    error: query.error instanceof Error ? query.error : null,
+  };
 }
 
 const EMPTY_PROFILE: UserProfile = { displayName: '', email: '', bio: '' };

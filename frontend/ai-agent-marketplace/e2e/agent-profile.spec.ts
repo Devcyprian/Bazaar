@@ -39,4 +39,22 @@ test.describe('Agent Profile page', () => {
     ).toBeVisible();
     await expect(page.getByText(agents[2].description)).toBeVisible();
   });
+
+  test('navigates from marketplace to agent profile and renders profile', async ({
+    page,
+  }) => {
+    await page.goto('/marketplace');
+
+    const agentCard = page
+      .getByRole('link', { name: new RegExp(agents[0].name, 'i') })
+      .first();
+    await expect(agentCard).toBeVisible();
+    await agentCard.click();
+
+    await expect(page).toHaveURL(new RegExp(`/agent/${agents[0].id}`));
+    await expect(
+      page.getByRole('heading', { name: agents[0].name }),
+    ).toBeVisible();
+    await expect(page.getByText(agents[0].description)).toBeVisible();
+  });
 });

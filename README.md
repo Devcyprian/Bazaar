@@ -556,6 +556,39 @@ pnpm exec playwright test --reporter=html && pnpm exec playwright show-report
 pnpm test:coverage
 ```
 
+### Bundle Size Budget & Analysis
+
+Vendor code is split into separate chunks (`react`, `stellar`, `ui`, `date`,
+`query`, etc.) via `manualChunks` in `vite.config.ts`, so the first load only
+pulls what a route needs. The initial JS budget is:
+
+| Budget | Limit (gzipped) |
+|--------|-----------------|
+| Main entry chunk (`index-*.js`) | **250 KB** |
+| Total initial JS (entry + eagerly loaded vendor chunks) | **500 KB** |
+
+Lazily loaded route chunks and the `stellar` vendor chunk (only needed once a
+wallet/contract interaction starts) are excluded from the initial budget.
+
+To inspect the bundle and verify the budget:
+
+```bash
+cd frontend/ai-agent-marketplace
+
+# Build with the bundle visualizer enabled (writes dist/stats.html)
+ANALYZE=1 pnpm build
+# or the shortcut script:
+pnpm analyze
+
+# Open the treemap report in a browser
+open dist/stats.html   # macOS (xdg-open on Linux, start on Windows)
+```
+
+`dist/stats.html` shows a gzipped/brotli treemap of every chunk. Check the
+`index-*.js` size and the sum of initial chunks against the table above; a PR
+that pushes either over budget should either justify it in the description or
+split the offending dependency into a lazy chunk.
+
 **E2E Test Coverage** (`e2e/`):
 | Spec file | What it covers |
 |-----------|---------------|

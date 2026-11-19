@@ -11,10 +11,10 @@ import { Badge } from '@/components/ui/Badge';
 import { useWallet } from '@/contexts/WalletContext';
 import { useStellar } from '@/contexts/StellarContext';
 import { isAddressBlocked } from '@/lib/compliance';
-import { 
-  DollarSign, Clock, Star, User, CheckCircle, AlertCircle, 
-  ArrowLeft, Send, Wallet, Loader2, Plus, X, Tag, ArrowUpDown,
-  Shield, FileText, MessageSquare, Brain, Code, Globe
+import {
+  DollarSign, CheckCircle, AlertCircle,
+  ArrowLeft, Send, Wallet, X, Tag, ArrowUpDown,
+  Shield, FileText
 } from 'lucide-react';
 import { clsx } from 'clsx';
 

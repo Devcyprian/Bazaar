@@ -49,4 +49,25 @@ test.describe('Navigation smoke tests', () => {
     expect(response?.status()).toBeLessThan(400);
     await expect(page.locator('body')).not.toBeEmpty();
   });
+
+  test('landing -> marketplace -> job detail flow', async ({ page }) => {
+    // 1. Landing page
+    const landingResponse = await page.goto('/');
+    expect(landingResponse?.status()).toBeLessThan(400);
+    await expect(page.locator('body')).not.toBeEmpty();
+
+    // 2. Navigate to the marketplace
+    await page.goto('/marketplace');
+    expect(new URL(page.url()).pathname).toBe('/marketplace');
+    await expect(page.locator('body')).not.toBeEmpty();
+
+    // 3. Open the first job listed by the mocked contract client
+    const firstJob = page.locator('[data-testid="job-card"]').first();
+    await expect(firstJob).toBeVisible();
+    await firstJob.click();
+
+    // 4. Job detail route should be reached and render content
+    await expect(page).toHaveURL(/\/jobs\/[^/]+$/);
+    await expect(page.locator('[data-testid="job-detail"]')).toBeVisible();
+  });
 });
