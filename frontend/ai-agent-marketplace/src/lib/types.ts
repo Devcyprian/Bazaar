@@ -71,6 +71,12 @@ export interface Job {
    * when available, otherwise `null`.
    */
   escrowCreatedAt: number | null;
+  /**
+   * Current status of the linked escrow, populated from `getEscrowByJob` when
+   * available, otherwise `null`. Used by the JobDetail reclaim UI to decide
+   * whether the escrow is still `Funded` and therefore reclaimable.
+   */
+  escrowStatus: EscrowStatus | null;
   createdAt: number;
   completedAt: number | null;
   deliverableHash: string | null;
