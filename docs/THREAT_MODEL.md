@@ -56,7 +56,7 @@ be paid out once.
 
 | Capability | Entrypoint | Effect |
 |------------|------------|--------|
-| Pause / unpause | `set_paused`, `pause`, `unpause` | Blocks every user entrypoint guarded by `ensure_not_paused`, including approvals, reclaims and `claim_funds` |
+| Pause / unpause | `set_paused`, `pause`, `unpause` | Blocks new work only (job creation, agent registration, bidding, bid acceptance, config and admin-list changes). Settlement, refund, dispute and review paths stay callable — see the pause matrix in §4.1 |
 | Denylist | `add_to_denylist`, `remove_from_denylist` | Blocks `post_job` and `place_bid` for an address |
 | Change fees | `update_config` | `platform_fee_bps` (≤ 10 000) and `platform_fee_bps_dispute` |
 | Redirect fees | `update_config` | Change `platform_fee_recipient` |
@@ -68,6 +68,39 @@ be paid out once.
 
 The admin **cannot**: change `usdc_token`, change `admin`, move funds outside the
 flows in §3, or edit jobs, bids, escrows or reviews directly.
+
+### 4.1 Pause matrix
+
+`set_paused(true)` is an incident switch, not a fund freeze. It stops new
+economic activity while leaving every path that moves already-escrowed funds or
+settles an existing job available. This guarantees a pause can never trap
+escrow: clients can still approve or reclaim, agents can still be paid, and
+disputes can still be raised and resolved.
+
+| Entrypoint | While paused | Rationale |
+|------------|--------------|-----------|
+| `post_job` / `create_job` | **Blocked** | New work / new escrow |
+| `register_agent` | **Blocked** | New participant onboarding |
+| `place_bid` | **Blocked** | New bids on existing jobs |
+| `accept_bid` | **Blocked** | Pulls new funds into escrow |
+| `update_config` | **Blocked** | Config changes during an incident |
+| `add_skill_verifier` / `remove_skill_verifier` | **Blocked** | Admin-list change |
+| `add_to_denylist` / `remove_from_denylist` | **Blocked** | Admin-list change |
+| `approve_deliverable` | **Allowed** | Settlement: releases escrow to the agent |
+| `raise_dispute` | **Allowed** | Dispute resolution path |
+| `resolve_dispute` | **Allowed** | Dispute resolution path |
+| `resolve_dispute_fallback` | **Allowed** | Dispute resolution path |
+| `withdraw_bid` | **Allowed** | Lets agents exit open bids |
+| `leave_review` | **Allowed** | Reputation settlement for completed jobs |
+| `reclaim_escrow` | **Allowed** | Refund path |
+| `reclaim_expired_escrow` | **Allowed** | Refund path |
+| `claim_funds` | **Allowed** | Payout of recorded claimable balances |
+| `cancel_job` | **Allowed** | Refund path for open jobs |
+
+Read-only getters and `bump_ttl` are always callable. The matrix is enforced by
+`ensure_not_paused` on the blocked entrypoints only and is covered by a
+table-driven test that exercises every entrypoint in both paused and unpaused
+states.
 
 ## 5. Threats and mitigations
 
@@ -82,7 +115,7 @@ Each threat is marked **Mitigated** or **Accepted risk**.
 | A3 | Admin points `platform_fee_recipient` at an attacker | Accepted risk | Affects only future fees, never escrow principal. Multisig + event monitoring. |
 | A4 | Admin resolves disputes in favour of one party | Accepted risk | Admin and resolver are trusted roles. Resolutions are public (`dispute_res` event) and auditable. |
 | A5 | Admin swaps `dispute_resolver` mid-dispute to block the original resolver | Mitigated | If disputes are left unresolved, either party can call `resolve_dispute_fallback` once `dispute_deadline` passes. |
-| A6 | Admin pauses indefinitely, freezing escrowed funds | Accepted risk | Pause is for incidents only (see the Incident Response section of the README); emits `pause`; multisig required. Funds remain in escrow, not transferable by admin. |
+| A6 | Admin pauses indefinitely, freezing escrowed funds | Mitigated | Pause blocks only new work (see the pause matrix in §4.1). Settlement, refund, dispute and review entrypoints (`approve_deliverable`, `raise_dispute`, `resolve_dispute`, `resolve_dispute_fallback`, `withdraw_bid`, `leave_review`, `reclaim_escrow`, `reclaim_expired_escrow`, `claim_funds`, `cancel_job`) remain callable, so escrowed funds can always be released or refunded. Pause emits `pause` and requires the multisig. |
 | A7 | Admin denylists a participant mid-job | Mitigated | The denylist only blocks `post_job` and `place_bid`; existing jobs can still be delivered, approved, disputed, reclaimed and claimed. |
 | A8 | Admin shortens `dispute_window_days` or `escrow_expiry_days` | Accepted risk | Dispute deadlines are fixed on each dispute when raised. Changes are visible via `config_upd`. |
 | A9 | Admin adds a colluding skill verifier | Accepted risk | `require_skill_verification` defaults to `false`; verifications are informational and public. |
@@ -126,11 +159,29 @@ Each threat is marked **Mitigated** or **Accepted risk**.
 | P3 | Contract state expires (TTL) | Mitigated | Every entrypoint extends the instance TTL; `bump_ttl` plus `scripts/keeper.sh` keep idle escrows alive. |
 | P4 | State growth raises per-call cost | Accepted risk | All entries live in instance storage, so cost grows with usage. Exposure caps limit growth during the canary phase; per-entrypoint budgets are tracked separately. |
 | P5 | Large loss from an undiscovered bug | Mitigated | Canary caps: `max_job_budget` (10 000 USDC) and `max_total_escrow` (100 000 USDC) limit exposure; pause is available for incidents. |
-| P6 | Reputation farming through self-dealing jobs | Accepted risk | Only job parties can review completed/refunded jobs; every fake job costs platform fees. |
+| P6 | Reputation farming through self-dealing jobs | Accepted risk | Only job parties can review completed/refunded jobs; every fake job costs platform fees. Reputation is derived exactly from stored `rating_sum`/`rating_count` (see §5.6), so it cannot be inflated by rounding. |
 | P7 | Bid front-running or copying | Accepted risk | Bids are public by design; the client chooses which bid to accept. |
 | P8 | Denylisted (sanctioned) addresses transacting | Mitigated | Denylisted addresses cannot post jobs or bid. Off-chain screening is covered in the compliance section of the README. |
 | P9 | Off-chain evidence or deliverables tampered with | Mitigated | `deliverable_hash` is stored on-chain; evidence URIs should point to content-addressed (IPFS) data. |
 | P10 | User wallet compromise | Accepted risk | Out of scope for the contract; the frontend never handles private keys (Freighter signing). |
+
+### 5.6 Reputation policy
+
+**Cold start (#119).** `register_agent` sets `reputation` to the configurable
+`Config.starting_reputation` (default `0`). To ensure a new agent can always
+place a first bid, `place_bid` exempts agents with zero completed jobs from
+`min_agent_reputation_to_bid`: the threshold is only enforced once an agent has
+at least one completed job. A new agent can therefore earn its first review
+under any positive minimum, and the policy is documented here and in the
+README.
+
+**Exact derivation (#120).** `Agent` stores `rating_sum` and `rating_count`
+instead of a lossy rolling average. `leave_review` increments both, and
+reputation is derived as `reputation = round(rating_sum * 20 / rating_count)`
+(integer rounding, half-up). Because it is computed from the totals rather than
+accumulated per review, the value is independent of review order and of
+`ReviewsByReviewee.len()`, and cannot drift through repeated integer division.
+A property test checks the derivation across random review sequences.
 
 ## 6. Review
 
