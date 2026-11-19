@@ -538,9 +538,11 @@ Soroban RPC or Freighter wallet is required. Run in any environment.
 
 - [ ] Audit smart contract (recommended: Trail of Bits, Certora)
 - [ ] Deploy to mainnet with multisig admin
+- [ ] Follow the [key management runbook](docs/mainnet/key-management.md) — mainnet admin key never stored in CI
 - [ ] Configure USDC mainnet contract ID
 - [ ] Set production RPC endpoints
 - [ ] Schedule `scripts/keeper.sh` (cron) to bump TTL of open escrows
+- [ ] Run `./scripts/smoke-test.sh mainnet <test-account>` after deploy and confirm it reports PASSED
 - [ ] Configure domain & SSL
 - [ ] Set up monitoring (Sentry, Datadog)
 - [ ] Load test with k6
@@ -549,7 +551,24 @@ Soroban RPC or Freighter wallet is required. Run in any environment.
 - [ ] Legal sign-off on sanctions/region restrictions ([record](docs/compliance/legal-signoff.md))
 - [ ] Review [incident runbook](docs/incidents/runbook.md) and confirm status page
 
+### CI/CD Environments
+
+The `main` branch pipeline deploys through two GitHub Environments
+(Settings → Environments):
+
+| Environment | Job | Protection | Secrets |
+|-------------|-----|------------|---------|
+| `testnet` | `deploy-testnet` | None — deploys automatically on push to `main` | Testnet `VERCEL_*` / `VITE_*` values |
+| `mainnet` | `deploy-mainnet` | Required reviewers — waits for manual approval | Mainnet `VERCEL_*` / `VITE_*` values |
+
+Store deploy secrets as environment secrets (not repository secrets) so each
+network only sees its own values. `deploy-mainnet` runs only after
+`deploy-testnet` succeeds.
+
 ### Deploy Contract (Mainnet)
+
+> Mainnet admin and deploy keys must be held on hardware wallets / KMS as described in
+> [`docs/mainnet/key-management.md`](docs/mainnet/key-management.md), not as plain CLI identities.
 
 ```bash
 # Use multisig for admin
@@ -565,6 +584,37 @@ stellar contract deploy \
 # Initialize with production config
 ./scripts/init-contract.sh mainnet
 ```
+
+### Verifying the Deployed Contract
+
+The release WASM is built in CI (`contract-optimize` job) with a pinned
+toolchain — Rust **1.81.0**, `cargo build --locked`, binaryen **version_115**
+`wasm-opt -Oz` — and its SHA-256 is published in each GitHub Release
+together with the `.wasm` file.
+
+To verify that the mainnet contract matches the source:
+
+```bash
+# 1. Check out the release tag and rebuild with the same toolchain
+git checkout v<N>
+rustup toolchain install 1.81.0 --target wasm32-unknown-unknown
+cd contracts/ai-agent-marketplace
+RUSTFLAGS="-D warnings --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$(cd ../.. && pwd)=/build" \
+  cargo +1.81.0 build --locked --target wasm32-unknown-unknown --release
+wasm-opt -Oz \
+  target/wasm32-unknown-unknown/release/ai_agent_marketplace.wasm \
+  -o target/wasm32-unknown-unknown/release/ai_agent_marketplace.opt.wasm
+sha256sum target/wasm32-unknown-unknown/release/ai_agent_marketplace.opt.wasm
+
+# 2. Fetch the WASM actually deployed on mainnet and hash it
+stellar contract fetch --id <CONTRACT_ID> --network mainnet -o deployed.wasm
+sha256sum deployed.wasm
+```
+
+Both hashes must equal the SHA-256 in the release notes. The on-chain WASM
+hash of a Soroban contract is the SHA-256 of the uploaded WASM, so the
+release hash also matches what `scripts/deploy-contract.sh` verifies after
+deploy.
 
 ### Deploy Frontend
 
