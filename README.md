@@ -555,12 +555,10 @@ Soroban RPC or Freighter wallet is required. Run in any environment.
 # Use multisig for admin
 stellar keys generate --global multisig-admin --network mainnet
 
-# Deploy with stellar-cli
-stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/ai_agent_marketplace.opt.wasm \
-  --source-account multisig-admin \
-  --network mainnet \
-  --alias ai-agent-marketplace-mainnet
+# Deploy (requires the explicit flag, a typed confirmation, and the
+# SHA-256 from the CI `contract-wasm` artifact's .sha256 file).
+# A log is saved to deployments/deploy-mainnet-<timestamp>.log
+EXPECTED_WASM_HASH=<sha256-from-ci> ./scripts/deploy-contract.sh mainnet multisig-admin --i-understand-this-is-mainnet
 
 # Initialize with production config
 ./scripts/init-contract.sh mainnet
