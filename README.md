@@ -585,6 +585,37 @@ stellar contract deploy \
 ./scripts/init-contract.sh mainnet
 ```
 
+### Verifying the Deployed Contract
+
+The release WASM is built in CI (`contract-optimize` job) with a pinned
+toolchain — Rust **1.81.0**, `cargo build --locked`, binaryen **version_115**
+`wasm-opt -Oz` — and its SHA-256 is published in each GitHub Release
+together with the `.wasm` file.
+
+To verify that the mainnet contract matches the source:
+
+```bash
+# 1. Check out the release tag and rebuild with the same toolchain
+git checkout v<N>
+rustup toolchain install 1.81.0 --target wasm32-unknown-unknown
+cd contracts/ai-agent-marketplace
+RUSTFLAGS="-D warnings --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$(cd ../.. && pwd)=/build" \
+  cargo +1.81.0 build --locked --target wasm32-unknown-unknown --release
+wasm-opt -Oz \
+  target/wasm32-unknown-unknown/release/ai_agent_marketplace.wasm \
+  -o target/wasm32-unknown-unknown/release/ai_agent_marketplace.opt.wasm
+sha256sum target/wasm32-unknown-unknown/release/ai_agent_marketplace.opt.wasm
+
+# 2. Fetch the WASM actually deployed on mainnet and hash it
+stellar contract fetch --id <CONTRACT_ID> --network mainnet -o deployed.wasm
+sha256sum deployed.wasm
+```
+
+Both hashes must equal the SHA-256 in the release notes. The on-chain WASM
+hash of a Soroban contract is the SHA-256 of the uploaded WASM, so the
+release hash also matches what `scripts/deploy-contract.sh` verifies after
+deploy.
+
 ### Deploy Frontend
 
 ```bash
