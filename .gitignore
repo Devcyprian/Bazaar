@@ -14,3 +14,6 @@ playwright-report/
 test-results/
 playwright/.cache/
 blob-report/
+
+# Ops reports
+reports/
